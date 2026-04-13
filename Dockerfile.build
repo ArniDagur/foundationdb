@@ -1,0 +1,187 @@
+# Multi-stage Dockerfile: compile FDB from source, produce images identical
+# in layout to the official packaging/docker/Dockerfile.
+#
+# Build the fdb-kubernetes-monitor image:
+#   docker build --platform linux/amd64 -f Dockerfile.build \
+#     --target fdb-kubernetes-monitor -t <registry>/<image>:<tag> .
+#
+# Build the foundationdb (fdbserver) image:
+#   docker build --platform linux/amd64 -f Dockerfile.build \
+#     --target foundationdb -t <registry>/<image>:<tag> .
+
+# ---------------------------------------------------------------------------
+# Stage 1a: build the actor compiler on native arch (avoids Mono/QEMU issues)
+# ---------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM ubuntu:24.04 AS actorcompiler-build
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y mono-devel && rm -rf /var/lib/apt/lists/*
+
+COPY flow/actorcompiler/ /src/flow/actorcompiler/
+COPY fdbclient/vexillographer/ /src/fdbclient/vexillographer/
+
+RUN mcs \
+    -r:System,System.Core,System.Xml.Linq,System.Data.DataSetExtensions,Microsoft.CSharp,System.Data,System.Xml \
+    /src/flow/actorcompiler/ActorCompiler.cs \
+    /src/flow/actorcompiler/ActorParser.cs \
+    /src/flow/actorcompiler/ParseTree.cs \
+    /src/flow/actorcompiler/Program.cs \
+    /src/flow/actorcompiler/Properties/AssemblyInfo.cs \
+    -target:exe -out:/actorcompiler.exe
+
+RUN mcs \
+    -r:System,System.Core,System.Data,System.Xml,System.Xml.Linq \
+    /src/fdbclient/vexillographer/c.cs \
+    /src/fdbclient/vexillographer/cpp.cs \
+    /src/fdbclient/vexillographer/java.cs \
+    /src/fdbclient/vexillographer/python.cs \
+    /src/fdbclient/vexillographer/ruby.cs \
+    /src/fdbclient/vexillographer/vexillographer.cs \
+    -target:exe -out:/vexillographer.exe
+
+# ---------------------------------------------------------------------------
+# Stage 1b: compile FDB C++ binaries (x86_64)
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS fdb-build
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    cmake \
+    gcc \
+    g++ \
+    make \
+    ninja-build \
+    git \
+    mono-runtime \
+    libmono-system-xml-linq4.0-cil \
+    bzip2 \
+    python3 \
+    libxml2-dev \
+    uuid-dev \
+    libssl-dev \
+    zlib1g-dev \
+    libjemalloc-dev \
+    liblz4-dev \
+    liburing-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-built actor compiler (compiled natively to avoid mcs/QEMU crash).
+# Provide stubs for mcs and mono so cmake configure passes. The mcs stub
+# copies the pre-built exe to the expected output path. The mono stub
+# uses interpreter mode to avoid JIT codegen issues under emulation.
+COPY --from=actorcompiler-build /actorcompiler.exe /opt/mono-tools/
+COPY --from=actorcompiler-build /vexillographer.exe /opt/mono-tools/
+# mcs stub: copy the matching pre-built exe to the -out: path.
+RUN printf '#!/bin/sh\nfor arg; do case "$arg" in -out:*) out="${arg#-out:}"; base=$(basename "$out"); cp "/opt/mono-tools/$base" "$out";; esac; done\n' > /usr/local/bin/mcs && chmod +x /usr/local/bin/mcs
+ENV MONO_ENV_OPTIONS=--interpreter
+
+COPY . /src
+WORKDIR /build
+
+# Pre-place the actor compiler exe where cmake expects it so it skips the mcs step.
+RUN cmake -G Ninja /src \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_DOCUMENTATION=OFF \
+    && cp /opt/mono-tools/actorcompiler.exe .
+
+RUN ninja fdbserver fdbcli fdbbackup fdbmonitor fdb_c
+
+# ---------------------------------------------------------------------------
+# Stage 2: build the Go kubernetes monitor binary
+# ---------------------------------------------------------------------------
+FROM golang:1.22.2-bullseye AS go-build
+
+COPY fdbkubernetesmonitor/ /fdbkubernetesmonitor
+WORKDIR /fdbkubernetesmonitor
+RUN go build -o /fdb-kubernetes-monitor *.go
+
+# ---------------------------------------------------------------------------
+# Stage 3: runtime base (matches official packaging/docker/Dockerfile)
+# ---------------------------------------------------------------------------
+FROM amazonlinux:2.0.20210326.0 AS base
+
+RUN yum install -y \
+    bind-utils \
+    binutils \
+    curl \
+    gdb \
+    hostname \
+    jq \
+    less \
+    lsof \
+    net-tools \
+    nmap-ncat \
+    perf \
+    perl \
+    procps-ng \
+    strace \
+    sysstat \
+    tar \
+    tcpdump \
+    telnet \
+    traceroute \
+    unzip \
+    vim-enhanced && \
+    yum clean all && \
+    rm -rf /var/cache/yum
+
+WORKDIR /tmp
+RUN curl -Ls https://github.com/krallin/tini/releases/download/v0.19.0/tini-amd64 -o tini && \
+    echo "93dcc18adc78c65a028a84799ecf8ad40c936fdfc5f2a57b1acda5a8117fa82c  tini" > tini-sha.txt && \
+    sha256sum --quiet -c tini-sha.txt && \
+    chmod +x tini && \
+    mv tini /usr/bin/ && \
+    rm -rf /tmp/*
+WORKDIR /
+
+# ---------------------------------------------------------------------------
+# Stage 4: foundationdb-base with compiled binaries
+# ---------------------------------------------------------------------------
+FROM base AS foundationdb-base
+
+RUN mkdir -p /var/fdb/{logs,tmp,lib} && \
+    mkdir -p /usr/lib/fdb/multiversion
+
+RUN groupadd --gid 4059 fdb && \
+    useradd --gid 4059 --uid 4059 --no-create-home --shell /bin/bash fdb && \
+    chown -R fdb:fdb /var/fdb
+
+# Install compiled binaries (replaces the curl downloads in the official Dockerfile)
+COPY --from=fdb-build /build/bin/fdbserver /usr/bin/
+COPY --from=fdb-build /build/bin/fdbcli /usr/bin/
+COPY --from=fdb-build /build/bin/fdbbackup /usr/bin/
+COPY --from=fdb-build /build/bin/fdbmonitor /usr/bin/
+COPY --from=fdb-build /build/lib/libfdb_c.so /usr/lib/libfdb_c.so
+
+RUN for file in fdbdr fdbrestore backup_agent dr_agent fastrestore_tool; do \
+        ln -s /usr/bin/fdbbackup "/usr/bin/$file"; \
+    done
+
+# ---------------------------------------------------------------------------
+# Stage 5: fdb-kubernetes-monitor (the image the operator uses)
+# ---------------------------------------------------------------------------
+FROM foundationdb-base AS fdb-kubernetes-monitor
+
+COPY --from=go-build /fdb-kubernetes-monitor /usr/bin/
+
+USER fdb
+WORKDIR /var/fdb
+VOLUME /var/fdb/data
+ENTRYPOINT ["/usr/bin/fdb-kubernetes-monitor"]
+
+# ---------------------------------------------------------------------------
+# Stage 6: standalone foundationdb server image
+# ---------------------------------------------------------------------------
+FROM foundationdb-base AS foundationdb
+
+COPY packaging/docker/fdb.bash packaging/docker/fdb_single.bash /var/fdb/scripts/
+RUN chmod a+x /var/fdb/scripts/fdb.bash /var/fdb/scripts/fdb_single.bash
+VOLUME /var/fdb/data
+ENV FDB_PORT 4500
+ENV FDB_CLUSTER_FILE /var/fdb/fdb.cluster
+ENV FDB_NETWORKING_MODE container
+ENV FDB_COORDINATOR ""
+ENV FDB_COORDINATOR_PORT 4500
+ENV FDB_CLUSTER_FILE_CONTENTS ""
+ENV FDB_PROCESS_CLASS unset
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/var/fdb/scripts/fdb.bash"]

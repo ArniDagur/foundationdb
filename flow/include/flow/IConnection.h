@@ -112,6 +112,7 @@ public:
 	void add(const std::string& host, const std::string& service, const std::vector<NetworkAddress>& addresses);
 	void remove(const std::string& host, const std::string& service);
 	void clear();
+	std::map<std::string, std::vector<NetworkAddress>> getEntries() const { return hostnameToAddresses; }
 
 	// Convert hostnameToAddresses to string. The format is:
 	// hostname1,host1Address1,host1Address2;hostname2,host2Address1,host2Address2...
