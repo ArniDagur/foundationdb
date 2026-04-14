@@ -63,6 +63,22 @@ Hostname Hostname::parse(const std::string& s) {
 ACTOR Future<Optional<NetworkAddress>> resolveImpl(const Hostname* self) {
 	try {
 		std::vector<NetworkAddress> addresses =
+		    wait(INetworkConnections::net()->resolveTCPEndpoint(self->host, self->service));
+		NetworkAddress address = INetworkConnections::pickOneAddress(addresses);
+		address.flags = 0; // Reset the parsed address to public
+		address.fromHostname = NetworkAddressFromHostname::True;
+		if (self->isTLS) {
+			address.flags |= NetworkAddress::FLAG_TLS;
+		}
+		return address;
+	} catch (...) {
+		return Optional<NetworkAddress>();
+	}
+}
+
+ACTOR Future<Optional<NetworkAddress>> resolveCachedImpl(const Hostname* self) {
+	try {
+		std::vector<NetworkAddress> addresses =
 		    wait(INetworkConnections::net()->resolveTCPEndpointWithDNSCache(self->host, self->service));
 		NetworkAddress address = INetworkConnections::pickOneAddress(addresses);
 		address.flags = 0; // Reset the parsed address to public
@@ -93,15 +109,56 @@ ACTOR Future<NetworkAddress> resolveWithRetryImpl(const Hostname* self) {
 	}
 }
 
+ACTOR Future<NetworkAddress> resolveWithRetryCachedImpl(const Hostname* self) {
+	state double resolveInterval = FLOW_KNOBS->HOSTNAME_RESOLVE_INIT_INTERVAL;
+	loop {
+		try {
+			Optional<NetworkAddress> address = wait(resolveCachedImpl(self));
+			if (address.present()) {
+				return address.get();
+			}
+			wait(delay(resolveInterval));
+			resolveInterval = std::min(2 * resolveInterval, FLOW_KNOBS->HOSTNAME_RESOLVE_MAX_INTERVAL);
+		} catch (Error& e) {
+			ASSERT(e.code() == error_code_actor_cancelled);
+			throw;
+		}
+	}
+}
+
 Future<Optional<NetworkAddress>> Hostname::resolve() {
 	return resolveImpl(this);
+}
+
+Future<Optional<NetworkAddress>> Hostname::resolveCached() {
+	return resolveCachedImpl(this);
 }
 
 Future<NetworkAddress> Hostname::resolveWithRetry() const {
 	return resolveWithRetryImpl(this);
 }
 
+Future<NetworkAddress> Hostname::resolveWithRetryCached() const {
+	return resolveWithRetryCachedImpl(this);
+}
+
 Optional<NetworkAddress> Hostname::resolveBlocking() const {
+	try {
+		std::vector<NetworkAddress> addresses =
+		    INetworkConnections::net()->resolveTCPEndpointBlocking(host, service);
+		NetworkAddress address = INetworkConnections::pickOneAddress(addresses);
+		address.flags = 0; // Reset the parsed address to public
+		address.fromHostname = NetworkAddressFromHostname::True;
+		if (isTLS) {
+			address.flags |= NetworkAddress::FLAG_TLS;
+		}
+		return address;
+	} catch (...) {
+		return Optional<NetworkAddress>();
+	}
+}
+
+Optional<NetworkAddress> Hostname::resolveCachedBlocking() const {
 	try {
 		std::vector<NetworkAddress> addresses =
 		    INetworkConnections::net()->resolveTCPEndpointBlockingWithDNSCache(host, service);

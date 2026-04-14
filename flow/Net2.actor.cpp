@@ -1503,17 +1503,11 @@ ActorLineageSet& Net2::getActorLineageSet() {
 }
 #endif
 
-static Future<Void> coordinatorDNSCacheRefresh(Net2* self);
-
 void Net2::run() {
 	TraceEvent::setNetworkThread();
 	TraceEvent("Net2Running").log();
 
 	thread_network = this;
-
-	if (FLOW_KNOBS->ENABLE_COORDINATOR_DNS_CACHE) {
-		dnsCacheRefreshActor = coordinatorDNSCacheRefresh(this);
-	}
 
 	unsigned int tasksSinceReact = 0;
 
@@ -1986,6 +1980,9 @@ ACTOR static Future<std::vector<NetworkAddress>> resolveTCPEndpointWithDNSCache_
                                                                                       std::string service) {
 	std::vector<NetworkAddress> addresses = wait(resolveTCPEndpoint_impl(self, host, service));
 	self->dnsCache.add(host, service, addresses);
+	if (!self->dnsCacheRefreshActor.isValid() || self->dnsCacheRefreshActor.isReady()) {
+		self->dnsCacheRefreshActor = coordinatorDNSCacheRefresh(self);
+	}
 	return addresses;
 }
 

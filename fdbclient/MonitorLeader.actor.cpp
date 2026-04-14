@@ -274,7 +274,7 @@ ACTOR Future<std::vector<NetworkAddress>> tryResolveHostnamesImpl(ClusterConnect
 	}
 	std::vector<Future<Void>> fs;
 	for (auto& hostname : self->hostnames) {
-		fs.push_back(map(hostname.resolve(), [&](Optional<NetworkAddress> const& addr) -> Void {
+		fs.push_back(map(hostname.resolveCached(), [&](Optional<NetworkAddress> const& addr) -> Void {
 			if (addr.present()) {
 				allCoordinatorsSet.insert(addr.get());
 			}
