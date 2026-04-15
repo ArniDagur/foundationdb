@@ -78,7 +78,7 @@ Future<REPLY_TYPE(Req)> retryBrokenPromise(RequestStream<Req, P> to, Req request
 
 ACTOR template <class Req>
 Future<Void> tryInitializeRequestStream(RequestStream<Req>* stream, Hostname hostname, WellKnownEndpoints token) {
-	Optional<NetworkAddress> address = wait(hostname.resolve());
+	Optional<NetworkAddress> address = wait(hostname.resolveCached());
 	if (!address.present()) {
 		return Void();
 	}
@@ -92,7 +92,7 @@ Future<ErrorOr<REPLY_TYPE(Req)>> tryGetReplyFromHostname(Req request, Hostname h
 	// A wrapper of tryGetReply(request), except that the request is sent to an address resolved from a hostname.
 	// If resolving fails, return lookup_failed().
 	// Otherwise, return tryGetReply(request).
-	Optional<NetworkAddress> address = wait(hostname.resolve());
+	Optional<NetworkAddress> address = wait(hostname.resolveCached());
 	if (!address.present()) {
 		return ErrorOr<REPLY_TYPE(Req)>(lookup_failed());
 	}
@@ -116,7 +116,7 @@ Future<ErrorOr<REPLY_TYPE(Req)>> tryGetReplyFromHostname(Req request,
 	// A wrapper of tryGetReply(request), except that the request is sent to an address resolved from a hostname.
 	// If resolving fails, return lookup_failed().
 	// Otherwise, return tryGetReply(request).
-	Optional<NetworkAddress> address = wait(hostname.resolve());
+	Optional<NetworkAddress> address = wait(hostname.resolveCached());
 	if (!address.present()) {
 		return ErrorOr<REPLY_TYPE(Req)>(lookup_failed());
 	}
@@ -140,7 +140,7 @@ Future<REPLY_TYPE(Req)> retryGetReplyFromHostname(Req request, Hostname hostname
 	state double reconnectInterval = FLOW_KNOBS->HOSTNAME_RECONNECT_INIT_INTERVAL;
 	state std::unique_ptr<RequestStream<Req>> to;
 	loop {
-		NetworkAddress address = wait(hostname.resolveWithRetry());
+		NetworkAddress address = wait(hostname.resolveWithRetryCached());
 		if (to == nullptr || to->getEndpoint().getPrimaryAddress() != address) {
 			to = std::make_unique<RequestStream<Req>>(Endpoint::wellKnown({ address }, token));
 		}
@@ -172,7 +172,7 @@ Future<REPLY_TYPE(Req)> retryGetReplyFromHostname(Req request,
 	state double reconnectInitInterval = FLOW_KNOBS->HOSTNAME_RECONNECT_INIT_INTERVAL;
 	state std::unique_ptr<RequestStream<Req>> to;
 	loop {
-		NetworkAddress address = wait(hostname.resolveWithRetry());
+		NetworkAddress address = wait(hostname.resolveWithRetryCached());
 		if (to == nullptr || to->getEndpoint().getPrimaryAddress() != address) {
 			to = std::make_unique<RequestStream<Req>>(Endpoint::wellKnown({ address }, token));
 		}
