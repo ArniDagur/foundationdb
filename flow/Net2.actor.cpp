@@ -1940,13 +1940,7 @@ Future<std::vector<NetworkAddress>> Net2::resolveTCPEndpoint(const std::string& 
 ACTOR static Future<Void> coordinatorDNSCacheRefresh(Net2* self) {
 	loop {
 		wait(delay(FLOW_KNOBS->COORDINATOR_DNS_CACHE_REFRESH_INTERVAL));
-		state std::vector<std::string> keys;
-		{
-			auto entries = self->dnsCache.getEntries();
-			for (const auto& entry : entries) {
-				keys.push_back(entry.first);
-			}
-		}
+		state std::vector<std::string> keys = self->dnsCache.getKeys();
 		state int i = 0;
 		for (; i < keys.size(); i++) {
 			auto colonPos = keys[i].find(':');
@@ -1955,9 +1949,22 @@ ACTOR static Future<Void> coordinatorDNSCacheRefresh(Net2* self) {
 			}
 			state std::string host = keys[i].substr(0, colonPos);
 			state std::string service = keys[i].substr(colonPos + 1);
+
+			// Evict if stale
+			double lastAccess = self->dnsCache.getLastAccess(host, service).orDefault(0.0);
+			double secondsSinceLastAccess = now() - lastAccess;
+			if (secondsSinceLastAccess > FLOW_KNOBS->COORDINATOR_DNS_CACHE_TTL) {
+				self->dnsCache.remove(host, service);
+				TraceEvent("DNSCacheEntryEvicted")
+				    .detail("Host", host)
+				    .detail("Service", service)
+				    .detail("SecondsSinceLastAccess", secondsSinceLastAccess);
+				continue;
+			}
+
 			try {
 				std::vector<NetworkAddress> newAddrs = wait(resolveTCPEndpoint_impl(self, host, service));
-				self->dnsCache.add(host, service, newAddrs);
+				self->dnsCache.update(host, service, newAddrs);
 				TraceEvent("DNSCacheRefreshed")
 				    .detail("Host", host)
 				    .detail("Service", service)
