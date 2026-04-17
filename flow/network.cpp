@@ -272,7 +272,10 @@ void DNSCache::update(const std::string& host,
 }
 
 void DNSCache::remove(const std::string& host, const std::string& service) {
-	entries.erase(host + ":" + service);
+	auto it = entries.find(host + ":" + service);
+	if (it != entries.end()) {
+		entries.erase(it);
+	}
 }
 
 void DNSCache::clear() {
