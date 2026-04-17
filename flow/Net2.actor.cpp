@@ -1951,8 +1951,7 @@ ACTOR static Future<Void> coordinatorDNSCacheRefresh(Net2* self) {
 			state std::string service = keys[i].substr(colonPos + 1);
 
 			// Evict if stale
-			double lastAccess = self->dnsCache.getLastAccess(host, service).orDefault(0.0);
-			double secondsSinceLastAccess = now() - lastAccess;
+			double secondsSinceLastAccess = now() - self->dnsCache.getLastAccess(host, service).orDefault(0.0);
 			if (secondsSinceLastAccess > FLOW_KNOBS->COORDINATOR_DNS_CACHE_TTL) {
 				self->dnsCache.remove(host, service);
 				TraceEvent("DNSCacheEntryEvicted")
