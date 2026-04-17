@@ -58,12 +58,11 @@ struct Hostname {
 
 	std::string toString() const { return host + ":" + service + (isTLS ? ":tls" : ""); }
 
+	// The resolve functions below use DNS cache.
 	Future<Optional<NetworkAddress>> resolve();
-	Future<Optional<NetworkAddress>> resolveCached();
 	Future<NetworkAddress> resolveWithRetry() const;
-	Future<NetworkAddress> resolveWithRetryCached() const;
-	Optional<NetworkAddress> resolveBlocking() const;
-	Optional<NetworkAddress> resolveCachedBlocking() const;
+	Optional<NetworkAddress> resolveBlocking() const; // This one should only be used when resolving asynchronously is
+	                                                  // impossible. For all other cases, resolve() should be preferred.
 
 	template <class Ar>
 	void serialize(Ar& ar) {

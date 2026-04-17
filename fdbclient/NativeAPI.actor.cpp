@@ -7660,7 +7660,7 @@ ACTOR Future<ProtocolVersion> getClusterProtocolImpl(
 			state NetworkAddress coordinatorAddress;
 			if (coordinator->get().get().hostname.present()) {
 				state Hostname h = coordinator->get().get().hostname.get();
-				wait(store(coordinatorAddress, h.resolveWithRetryCached()));
+				wait(store(coordinatorAddress, h.resolveWithRetry()));
 			} else {
 				coordinatorAddress = coordinator->get().get().getLeader.getEndpoint().getPrimaryAddress();
 			}

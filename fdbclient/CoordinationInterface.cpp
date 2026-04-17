@@ -50,7 +50,7 @@ IPAddress ClusterConnectionString::determineLocalSourceIP() const {
 				coordAddr = coords[index];
 			} else {
 				const Hostname& h = hostnames[index - coords.size()];
-				Optional<NetworkAddress> resolvedAddr = h.resolveCachedBlocking();
+				Optional<NetworkAddress> resolvedAddr = h.resolveBlocking();
 				if (!resolvedAddr.present()) {
 					throw lookup_failed();
 				}

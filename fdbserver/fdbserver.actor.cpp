@@ -966,7 +966,7 @@ std::pair<NetworkAddressList, NetworkAddressList> buildNetworkAddresses(
 		// If true, further check hostnames.
 		if (matchCoordinatorsTls) {
 			matchCoordinatorsTls = std::all_of(hostnames.begin(), hostnames.end(), [&](Hostname& hostname) {
-				Optional<NetworkAddress> resolvedAddress = hostname.resolveCachedBlocking();
+				Optional<NetworkAddress> resolvedAddress = hostname.resolveBlocking();
 				if (resolvedAddress.present()) {
 					NetworkAddress address = resolvedAddress.get();
 					if (address.ip == currentPublicAddress.ip && address.port == currentPublicAddress.port) {
