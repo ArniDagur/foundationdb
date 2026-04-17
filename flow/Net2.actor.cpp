@@ -1964,10 +1964,6 @@ ACTOR static Future<Void> coordinatorDNSCacheRefresh(Net2* self) {
 			try {
 				std::vector<NetworkAddress> newAddrs = wait(resolveTCPEndpoint_impl(self, host, service));
 				self->dnsCache.update(host, service, newAddrs);
-				TraceEvent("DNSCacheRefreshed")
-				    .detail("Host", host)
-				    .detail("Service", service)
-				    .detail("AddressCount", newAddrs.size());
 			} catch (Error& e) {
 				if (e.code() == error_code_actor_cancelled) {
 					throw;
