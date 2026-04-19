@@ -1333,6 +1333,7 @@ Net2::Net2(const TLSConfig& tlsConfig, bool useThreadPool, bool useMetrics)
 #endif
 
 	updateNow();
+	dnsCacheRefreshActor = coordinatorDNSCacheRefresh(this);
 }
 
 ACTOR static Future<Void> reloadCertificatesOnChange(
@@ -1938,6 +1939,9 @@ Future<std::vector<NetworkAddress>> Net2::resolveTCPEndpoint(const std::string& 
 }
 
 ACTOR static Future<Void> coordinatorDNSCacheRefresh(Net2* self) {
+	if (!FLOW_KNOBS->ENABLE_COORDINATOR_DNS_CACHE) {
+		return Void();
+	}
 	loop {
 		wait(delay(FLOW_KNOBS->COORDINATOR_DNS_CACHE_REFRESH_INTERVAL));
 		state std::vector<std::string> keys = self->dnsCache.getKeys();
@@ -1982,9 +1986,6 @@ ACTOR static Future<std::vector<NetworkAddress>> resolveTCPEndpointWithDNSCache_
                                                                                       std::string service) {
 	std::vector<NetworkAddress> addresses = wait(resolveTCPEndpoint_impl(self, host, service));
 	self->dnsCache.add(host, service, addresses);
-	if (!self->dnsCacheRefreshActor.isValid() || self->dnsCacheRefreshActor.isReady()) {
-		self->dnsCacheRefreshActor = coordinatorDNSCacheRefresh(self);
-	}
 	return addresses;
 }
 
