@@ -1974,18 +1974,15 @@ ACTOR static Future<Void> coordinatorDNSCacheRefresh(Net2* self) {
 				if (e.code() == error_code_actor_cancelled) {
 					throw;
 				}
-				TraceEvent(SevWarn, "DNSCacheRefreshFailed")
-				    .error(e)
-				    .detail("Host", host)
-				    .detail("Service", service);
+				TraceEvent(SevWarn, "DNSCacheRefreshFailed").error(e).detail("Host", host).detail("Service", service);
 			}
 		}
 	}
 }
 
 ACTOR static Future<std::vector<NetworkAddress>> resolveTCPEndpointWithDNSCache_impl(Net2* self,
-                                                                                      std::string host,
-                                                                                      std::string service) {
+                                                                                     std::string host,
+                                                                                     std::string service) {
 	std::vector<NetworkAddress> addresses = wait(resolveTCPEndpoint_impl(self, host, service));
 	self->dnsCache.add(host, service, addresses);
 	return addresses;
@@ -2372,7 +2369,7 @@ TEST_CASE("noSim/flow/Net2/onMainThreadFIFO") {
 	return Void();
 }
 
-void net2_test(){
+void net2_test() {
 	/*
 	g_network = newNet2();  // for promise serialization below
 
