@@ -1305,6 +1305,8 @@ private:
 
 // 5MB for loading files into memory
 
+ACTOR static Future<Void> coordinatorDNSCacheRefresh(Net2* self);
+
 Net2::Net2(const TLSConfig& tlsConfig, bool useThreadPool, bool useMetrics)
   : globals(enumGlobal::COUNT), useThreadPool(useThreadPool), reactor(this),
     sslContextVar({ ReferencedObject<boost::asio::ssl::context>::from(
