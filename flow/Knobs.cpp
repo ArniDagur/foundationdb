@@ -197,6 +197,12 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( SQLITE_DISK_METRIC_LOGGING_INTERVAL,                 5.0 );
 	init( KAIO_LATENCY_LOGGING_INTERVAL,                      30.0 );
 	init( KAIO_LATENCY_SKETCH_ACCURACY,                       0.01 );
+	// Linux caches IOMMU IOVA ranges only up to 128KiB per DMA mapping; larger mappings (large iocbs, or small
+	// iocbs merged by the block-layer plug that io_submit() installs for more than 2 iocbs) take a global
+	// per-device spinlock that collapses under many concurrent writers when the IOMMU is in translated mode.
+	// 131072 and 2 keep every request at or below 128KiB on such hosts.
+	init( KAIO_MAX_IO_BYTES,                                     0 );
+	init( KAIO_MAX_IOCBS_PER_SUBMIT,                             0 );
 
 	init( PAGE_WRITE_CHECKSUM_HISTORY,                           0 ); if( randomize && buggify() ) PAGE_WRITE_CHECKSUM_HISTORY = 10000000;
 	init( DISABLE_POSIX_KERNEL_AIO,                              0 );

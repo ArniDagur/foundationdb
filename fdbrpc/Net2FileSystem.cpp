@@ -127,6 +127,99 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/RequestList") {
 		co_await AsyncFileEIO::deleteFile(f->getFilename(), true);
 	}
 }
+
+// KAIO_MAX_IO_BYTES / KAIO_MAX_IOCBS_PER_SUBMIT must split large reads and writes into bounded iocbs and bounded
+// io_submit() calls without changing what is read or written, and must leave behavior unchanged when disabled.
+TEST_CASE("/fdbrpc/AsyncFileKAIO/SplitLargeIO") {
+	if (g_network->isSimulated()) {
+		co_return;
+	}
+	auto* knobs = const_cast<FlowKnobs*>(FLOW_KNOBS);
+	const int savedMaxIOBytes = knobs->KAIO_MAX_IO_BYTES;
+	const int savedMaxIOCBsPerSubmit = knobs->KAIO_MAX_IOCBS_PER_SUBMIT;
+	constexpr int chunk = 128 << 10;
+	constexpr int length = (1 << 20) + 3 * 4096; // 8 full chunks and one partial chunk
+	constexpr int expectedParts = (length + chunk - 1) / chunk;
+	constexpr int64_t offset = 8192;
+	uint8_t* wbuf = static_cast<uint8_t*>(allocateFast4kAligned(length));
+	uint8_t* rbuf = static_cast<uint8_t*>(allocateFast4kAligned(length));
+	for (int i = 0; i < length; i++) {
+		wbuf[i] = static_cast<uint8_t>(deterministicRandom()->randomInt(0, 256));
+	}
+	const std::string filename =
+	    format("/tmp/__KAIO_SPLIT_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str());
+	Reference<IAsyncFile> f;
+	Optional<Error> err;
+	try {
+		f = co_await AsyncFileKAIO::open(filename,
+		                                 IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE |
+		                                     IAsyncFile::OPEN_CREATE,
+		                                 0666,
+		                                 nullptr);
+
+		knobs->KAIO_MAX_IO_BYTES = chunk;
+		knobs->KAIO_MAX_IOCBS_PER_SUBMIT = 2;
+
+		AsyncFileKAIO::resetSubmitStats();
+		co_await f->write(wbuf, length, offset);
+		auto stats = AsyncFileKAIO::getSubmitStats();
+		ASSERT_EQ(stats.submittedIOCBs, expectedParts);
+		ASSERT_EQ(stats.largestSubmittedIOBytes, chunk);
+		ASSERT_LE(stats.largestSubmitBatch, 2);
+		ASSERT_GE(stats.submitCalls, (expectedParts + 1) / 2);
+		co_await f->sync();
+		const int64_t fileSize = co_await f->size();
+		ASSERT_EQ(fileSize, offset + length);
+
+		AsyncFileKAIO::resetSubmitStats();
+		memset(rbuf, 0, length);
+		int n = co_await f->read(rbuf, length, offset);
+		stats = AsyncFileKAIO::getSubmitStats();
+		ASSERT_EQ(n, length);
+		ASSERT(memcmp(rbuf, wbuf, length) == 0);
+		ASSERT_EQ(stats.submittedIOCBs, expectedParts);
+		ASSERT_LE(stats.largestSubmittedIOBytes, chunk);
+
+		// A split read that runs past end of file returns only the bytes before it, like an unsplit read.
+		constexpr int tail = 200 << 10;
+		memset(rbuf, 0, length);
+		n = co_await f->read(rbuf, 512 << 10, offset + length - tail);
+		ASSERT_EQ(n, tail);
+		ASSERT(memcmp(rbuf, wbuf + length - tail, tail) == 0);
+
+		// Knob values that are not 4KiB multiples are rounded down to one.
+		knobs->KAIO_MAX_IO_BYTES = chunk + 100;
+		AsyncFileKAIO::resetSubmitStats();
+		co_await f->write(wbuf, length, offset);
+		ASSERT_EQ(AsyncFileKAIO::getSubmitStats().largestSubmittedIOBytes, chunk);
+
+		// Disabled: one iocb per request, submitted together.
+		knobs->KAIO_MAX_IO_BYTES = 0;
+		knobs->KAIO_MAX_IOCBS_PER_SUBMIT = 0;
+		AsyncFileKAIO::resetSubmitStats();
+		co_await f->write(wbuf, length, offset + length);
+		stats = AsyncFileKAIO::getSubmitStats();
+		ASSERT_EQ(stats.submittedIOCBs, 1);
+		ASSERT_EQ(stats.largestSubmittedIOBytes, length);
+		ASSERT_EQ(stats.submitCalls, 1);
+		memset(rbuf, 0, length);
+		n = co_await f->read(rbuf, length, offset + length);
+		ASSERT_EQ(n, length);
+		ASSERT(memcmp(rbuf, wbuf, length) == 0);
+	} catch (Error& e) {
+		err = e;
+	}
+	knobs->KAIO_MAX_IO_BYTES = savedMaxIOBytes;
+	knobs->KAIO_MAX_IOCBS_PER_SUBMIT = savedMaxIOCBsPerSubmit;
+	freeFast4kAligned(length, wbuf);
+	freeFast4kAligned(length, rbuf);
+	if (f) {
+		co_await AsyncFileEIO::deleteFile(filename, true);
+	}
+	if (err.present()) {
+		throw err.get();
+	}
+}
 #endif // __linux__
 
 // Opens a file for asynchronous I/O

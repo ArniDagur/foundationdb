@@ -228,6 +228,20 @@ public:
 			return io_timeout();
 		}
 
+		const int chunk = maxIOBytes();
+		if (chunk > 0 && length > chunk) {
+			std::vector<Future<int>> parts;
+			for (int done = 0; done < length; done += chunk) {
+				IOBlock* io = new IOBlock(IO_CMD_PREAD, fd);
+				io->buf = static_cast<uint8_t*>(data) + done;
+				io->nbytes = std::min(chunk, length - done);
+				io->offset = offset + done;
+				enqueue(io, "read", this);
+				parts.push_back(io->result.getFuture());
+			}
+			return sumReadParts(std::move(parts));
+		}
+
 		IOBlock* io = new IOBlock(IO_CMD_PREAD, fd);
 		io->buf = data;
 		io->nbytes = length;
@@ -242,6 +256,24 @@ public:
 
 		return result;
 	}
+
+	// Effective per-iocb size limit from KAIO_MAX_IO_BYTES, or 0 if reads/writes are not split.
+	static int maxIOBytes() {
+		const int limit = FLOW_KNOBS->KAIO_MAX_IO_BYTES;
+		return limit > 0 ? std::max(4096, limit / 4096 * 4096) : 0;
+	}
+
+	// A split read returns the total bytes read. Each part only comes up short at end of file, and every later
+	// part then reads 0 bytes, so the sum matches what a single read of the whole range returns. All parts must
+	// finish before returning or throwing, because the caller may release the buffer as soon as we do.
+	static Future<int> sumReadParts(std::vector<Future<int>> parts) {
+		co_await waitForAllReady(parts);
+		int total = 0;
+		for (auto& part : parts) {
+			total += part.get();
+		}
+		co_return total;
+	}
 	Future<Void> write(void const* data, int length, int64_t offset) override {
 		++countFileLogicalWrites;
 		++countLogicalWrites;
@@ -249,6 +281,23 @@ public:
 
 		if (failed) {
 			return io_timeout();
+		}
+
+		const int chunk = maxIOBytes();
+		if (chunk > 0 && length > chunk) {
+			nextFileSize = std::max(nextFileSize, offset + length);
+			std::vector<Future<Void>> parts;
+			for (int done = 0; done < length; done += chunk) {
+				IOBlock* io = new IOBlock(IO_CMD_PWRITE, fd);
+				io->buf = (void*)(static_cast<const uint8_t*>(data) + done);
+				io->nbytes = std::min(chunk, length - done);
+				io->offset = offset + done;
+				enqueue(io, "write", this);
+				parts.push_back(io->writeResult.getFuture());
+			}
+			// Not waitForAll(): the caller may release the buffer once this returns, so a failed part must not
+			// complete the write while other parts are still in flight.
+			return waitForAllReadyThenThrow(parts);
 		}
 
 		IOBlock* io = new IOBlock(IO_CMD_PWRITE, fd);
@@ -440,7 +489,7 @@ public:
 				}
 			}
 			double truncateComplete = timer_monotonic();
-			int rc = io_submit(ctx.iocx, n, (linux_iocb**)toStart);
+			int rc = submitIOCBs(toStart, n);
 			double end = timer_monotonic();
 
 			if (end - begin > FLOW_KNOBS->SLOW_LOOP_CUTOFF) {
@@ -488,6 +537,19 @@ public:
 				ctx.queue.push(toStart[i]);
 			}
 		}
+	}
+
+	struct SubmitStats {
+		int64_t submitCalls;
+		int64_t submittedIOCBs;
+		int64_t largestSubmittedIOBytes;
+		int64_t largestSubmitBatch;
+	};
+	static SubmitStats getSubmitStats() {
+		return SubmitStats{ ctx.submitCalls, ctx.submittedIOCBs, ctx.largestSubmittedIOBytes, ctx.largestSubmitBatch };
+	}
+	static void resetSubmitStats() {
+		ctx.submitCalls = ctx.submittedIOCBs = ctx.largestSubmittedIOBytes = ctx.largestSubmitBatch = 0;
 	}
 
 	bool failed;
@@ -612,9 +674,14 @@ private:
 		EventMetricHandle<SlowAioSubmit> slowAioSubmitMetric;
 
 		uint32_t opsIssued;
+		int64_t submitCalls;
+		int64_t submittedIOCBs;
+		int64_t largestSubmittedIOBytes;
+		int64_t largestSubmitBatch;
 		Context()
 		  : iocx(0), evfd(-1), outstanding(0), ioStallBegin(0), fallocateSupported(true), fallocateZeroSupported(true),
-		    submittedRequestList(nullptr), opsIssued(0) {
+		    submittedRequestList(nullptr), opsIssued(0), submitCalls(0), submittedIOCBs(0), largestSubmittedIOBytes(0),
+		    largestSubmitBatch(0) {
 			setIOTimeout(0);
 		}
 
@@ -662,6 +729,31 @@ private:
 		}
 	};
 	static Context ctx;
+
+	// Submits toStart[0..n) in io_submit() calls of at most KAIO_MAX_IOCBS_PER_SUBMIT iocbs. Returns the number
+	// of iocbs accepted, or -1 with errno set if the first iocb could not be submitted, like a single io_submit().
+	static int submitIOCBs(IOBlock** toStart, int n) {
+		const int batch = FLOW_KNOBS->KAIO_MAX_IOCBS_PER_SUBMIT > 0 ? FLOW_KNOBS->KAIO_MAX_IOCBS_PER_SUBMIT : n;
+		int accepted = 0;
+		while (accepted < n) {
+			const int m = std::min(batch, n - accepted);
+			const int rc = io_submit(ctx.iocx, m, (linux_iocb**)(toStart + accepted));
+			++ctx.submitCalls;
+			ctx.largestSubmitBatch = std::max<int64_t>(ctx.largestSubmitBatch, m);
+			if (rc < 0) {
+				return accepted > 0 ? accepted : rc;
+			}
+			for (int i = accepted; i < accepted + rc; i++) {
+				++ctx.submittedIOCBs;
+				ctx.largestSubmittedIOBytes = std::max<int64_t>(ctx.largestSubmittedIOBytes, toStart[i]->nbytes);
+			}
+			accepted += rc;
+			if (rc < m) {
+				break;
+			}
+		}
+		return accepted;
+	}
 
 	explicit AsyncFileKAIO(int fd, int flags, std::string const& filename)
 	  : failed(false), fd(fd), flags(flags), filename(filename) {

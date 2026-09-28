@@ -276,6 +276,11 @@ public:
 	double SQLITE_DISK_METRIC_LOGGING_INTERVAL;
 	double KAIO_LATENCY_LOGGING_INTERVAL;
 	double KAIO_LATENCY_SKETCH_ACCURACY;
+	// If > 0, reads/writes larger than this many bytes are issued as several iocbs of at most this size
+	// (rounded down to a 4KiB multiple).
+	int KAIO_MAX_IO_BYTES;
+	// If > 0, io_submit() is called with at most this many iocbs at a time.
+	int KAIO_MAX_IOCBS_PER_SUBMIT;
 
 	int PAGE_WRITE_CHECKSUM_HISTORY;
 	int DISABLE_POSIX_KERNEL_AIO;
