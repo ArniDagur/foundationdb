@@ -220,6 +220,100 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/SplitLargeIO") {
 		throw err.get();
 	}
 }
+
+// Many concurrent reads and writes of random sizes and offsets, under random KAIO split settings, must read back
+// exactly what an in-memory copy of the file holds. Writes in one round never overlap, so their completion order
+// does not matter.
+TEST_CASE("/fdbrpc/AsyncFileKAIO/SplitRandomIO") {
+	if (g_network->isSimulated()) {
+		co_return;
+	}
+	auto* knobs = const_cast<FlowKnobs*>(FLOW_KNOBS);
+	const int savedMaxIOBytes = knobs->KAIO_MAX_IO_BYTES;
+	const int savedMaxIOCBsPerSubmit = knobs->KAIO_MAX_IOCBS_PER_SUBMIT;
+	constexpr int pageSize = 4096;
+	constexpr int fileSize = 64 << 20;
+	constexpr int maxOpBytes = 1 << 20;
+	const int rounds = params.getInt("rounds").orDefault(40);
+	const int opsPerRound = 16;
+	std::vector<uint8_t> shadow(fileSize, 0);
+	std::vector<uint8_t*> bufs;
+	for (int i = 0; i < opsPerRound; i++) {
+		bufs.push_back(static_cast<uint8_t*>(allocateFast4kAligned(maxOpBytes)));
+	}
+	const std::string filename =
+	    format("/tmp/__KAIO_SPLIT_RANDOM_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str());
+	Reference<IAsyncFile> f;
+	Optional<Error> err;
+	int64_t splitOps = 0;
+	try {
+		f = co_await AsyncFileKAIO::open(filename,
+		                                 IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE |
+		                                     IAsyncFile::OPEN_CREATE,
+		                                 0666,
+		                                 nullptr);
+		co_await f->truncate(fileSize);
+
+		const int maxIOChoices[] = { 0, 4096, 64 << 10, 128 << 10, (128 << 10) + 4096, 300 << 10 };
+		for (int round = 0; round < rounds; round++) {
+			knobs->KAIO_MAX_IO_BYTES = maxIOChoices[deterministicRandom()->randomInt(0, 6)];
+			knobs->KAIO_MAX_IOCBS_PER_SUBMIT = deterministicRandom()->randomInt(0, 4);
+			const int chunk = AsyncFileKAIO::maxIOBytes();
+
+			// Non-overlapping writes: split the file into opsPerRound slots and write a random span in each.
+			std::vector<Future<Void>> writes;
+			const int slotPages = fileSize / pageSize / opsPerRound;
+			for (int i = 0; i < opsPerRound; i++) {
+				const int pages = deterministicRandom()->randomInt(1, std::min(slotPages, maxOpBytes / pageSize) + 1);
+				const int startPage = i * slotPages + deterministicRandom()->randomInt(0, slotPages - pages + 1);
+				const int length = pages * pageSize;
+				const int64_t offset = int64_t(startPage) * pageSize;
+				for (int b = 0; b < length; b++) {
+					bufs[i][b] = static_cast<uint8_t>(deterministicRandom()->randomInt(0, 256));
+				}
+				memcpy(shadow.data() + offset, bufs[i], length);
+				splitOps += (chunk > 0 && length > chunk) ? 1 : 0;
+				writes.push_back(f->write(bufs[i], length, offset));
+			}
+			co_await waitForAll(writes);
+			if (deterministicRandom()->coinflip()) {
+				co_await f->sync();
+			}
+
+			// Overlapping reads anywhere in the file, including ranges that end exactly at end of file.
+			std::vector<Future<int>> reads;
+			std::vector<std::pair<int64_t, int>> ranges;
+			for (int i = 0; i < opsPerRound; i++) {
+				const int pages = deterministicRandom()->randomInt(1, maxOpBytes / pageSize + 1);
+				const int64_t offset =
+				    int64_t(deterministicRandom()->randomInt(0, fileSize / pageSize - pages + 1)) * pageSize;
+				ranges.emplace_back(offset, pages * pageSize);
+				splitOps += (chunk > 0 && pages * pageSize > chunk) ? 1 : 0;
+				reads.push_back(f->read(bufs[i], pages * pageSize, offset));
+			}
+			for (int i = 0; i < opsPerRound; i++) {
+				const int n = co_await reads[i];
+				ASSERT_EQ(n, ranges[i].second);
+				ASSERT(memcmp(bufs[i], shadow.data() + ranges[i].first, n) == 0);
+			}
+		}
+		// The random settings must actually have exercised the split path.
+		ASSERT_GT(splitOps, 0);
+	} catch (Error& e) {
+		err = e;
+	}
+	knobs->KAIO_MAX_IO_BYTES = savedMaxIOBytes;
+	knobs->KAIO_MAX_IOCBS_PER_SUBMIT = savedMaxIOCBsPerSubmit;
+	for (auto* b : bufs) {
+		freeFast4kAligned(maxOpBytes, b);
+	}
+	if (f) {
+		co_await AsyncFileEIO::deleteFile(filename, true);
+	}
+	if (err.present()) {
+		throw err.get();
+	}
+}
 #endif // __linux__
 
 // Opens a file for asynchronous I/O
