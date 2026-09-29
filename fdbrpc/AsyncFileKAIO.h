@@ -416,13 +416,20 @@ public:
 		KAIOLogEvent(logFile, id, OpLogEntry::SYNC, OpLogEntry::START);
 		double start_time = timer();
 
-		Future<Void> fsync = throwErrorIfFailed(
-		    Reference<AsyncFileKAIO>::addRef(this),
-		    AsyncFileEIO::async_fdatasync(fd)); // Don't close the file until the asynchronous thing is done
-		// Alas, AIO f(data)sync doesn't seem to actually be implemented by the kernel
-		/*IOBlock *io = new IOBlock(IO_CMD_FDSYNC, fd);
-		submit(io, "write");
-		fsync=success(io->result.getFuture());*/
+		Future<Void> fsync;
+		if (FLOW_KNOBS->KAIO_FDSYNC && ctx.fdsyncSupported) {
+			// Callers only sync after their writes have completed, so ordering against in-flight iocbs is not
+			// needed; the kernel runs the fdatasync on a workqueue and completes it through the KAIO eventfd.
+			IOBlock* io = new IOBlock(IO_CMD_FDSYNC, fd);
+			enqueue(io, "sync", this);
+			++ctx.fdsyncSubmitted;
+			fsync = throwErrorIfFailed(Reference<AsyncFileKAIO>::addRef(this),
+			                           fdsyncOrFallback(io->result.getFuture(), fd));
+		} else {
+			fsync = throwErrorIfFailed(
+			    Reference<AsyncFileKAIO>::addRef(this),
+			    AsyncFileEIO::async_fdatasync(fd)); // Don't close the file until the asynchronous thing is done
+		}
 
 		fsync = map(fsync, [=](Void r) mutable {
 			KAIOLogEvent(logFile, id, OpLogEntry::SYNC, OpLogEntry::COMPLETE);
@@ -438,6 +445,36 @@ public:
 
 		return fsync;
 	}
+	// Result a rejected IOCB_CMD_FDSYNC is delivered as; a successful one completes with 0.
+	static constexpr int kFdsyncUnsupported = 1;
+
+	// Kernels before 4.18, and filesystems without aio fsync, reject IOCB_CMD_FDSYNC with EINVAL; from then on
+	// every sync() uses the EIO thread pool.
+	static Future<Void> fdsyncOrFallback(Future<int> fdsync, int fd) {
+		const int r = co_await fdsync;
+		if (r == kFdsyncUnsupported) {
+			if (ctx.fdsyncSupported) {
+				ctx.fdsyncSupported = false;
+				TraceEvent(SevWarnAlways, "AsyncFileKAIOFdsyncUnsupported").detail("Fd", fd);
+			}
+			++ctx.fdsyncFallbacks;
+			co_await AsyncFileEIO::async_fdatasync(fd);
+		}
+	}
+
+	struct FdsyncStats {
+		int64_t submitted;
+		int64_t fallbacks;
+		bool supported;
+	};
+	static FdsyncStats getFdsyncStats() {
+		return FdsyncStats{ ctx.fdsyncSubmitted, ctx.fdsyncFallbacks, ctx.fdsyncSupported };
+	}
+	static void resetFdsyncStats() {
+		ctx.fdsyncSubmitted = ctx.fdsyncFallbacks = 0;
+		ctx.fdsyncSupported = true;
+	}
+
 	Future<int64_t> size() const override { return nextFileSize; }
 	int64_t debugFD() const override { return fd; }
 	std::string getFilename() const override { return filename; }
@@ -614,6 +651,11 @@ private:
 		}
 
 		void setResult(int r) {
+			if (aio_lio_opcode == IO_CMD_FDSYNC && r == -EINVAL) {
+				deliver(std::move(result), owner->failed, kFdsyncUnsupported, getTask());
+				delete this;
+				return;
+			}
 			if (r < 0) {
 				struct stat fst;
 				fstat(aio_fildes, &fst);
@@ -659,6 +701,9 @@ private:
 		double ioStallBegin;
 		bool fallocateSupported;
 		bool fallocateZeroSupported;
+		bool fdsyncSupported;
+		int64_t fdsyncSubmitted;
+		int64_t fdsyncFallbacks;
 		std::priority_queue<IOBlock*, std::vector<IOBlock*>, IOBlock::indirect_order_by_priority> queue;
 		Int64MetricHandle countAIOSubmit;
 		Int64MetricHandle countAIOCollect;
@@ -680,8 +725,8 @@ private:
 		int64_t largestSubmitBatch;
 		Context()
 		  : iocx(0), evfd(-1), outstanding(0), ioStallBegin(0), fallocateSupported(true), fallocateZeroSupported(true),
-		    submittedRequestList(nullptr), opsIssued(0), submitCalls(0), submittedIOCBs(0), largestSubmittedIOBytes(0),
-		    largestSubmitBatch(0) {
+		    fdsyncSupported(true), fdsyncSubmitted(0), fdsyncFallbacks(0), submittedRequestList(nullptr), opsIssued(0),
+		    submitCalls(0), submittedIOCBs(0), largestSubmittedIOBytes(0), largestSubmitBatch(0) {
 			setIOTimeout(0);
 		}
 

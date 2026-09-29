@@ -203,6 +203,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	// 131072 and 2 keep every request at or below 128KiB on such hosts.
 	init( KAIO_MAX_IO_BYTES,                                     0 );
 	init( KAIO_MAX_IOCBS_PER_SUBMIT,                             0 );
+	init( KAIO_FDSYNC,                                       false );
 
 	init( PAGE_WRITE_CHECKSUM_HISTORY,                           0 ); if( randomize && buggify() ) PAGE_WRITE_CHECKSUM_HISTORY = 10000000;
 	init( DISABLE_POSIX_KERNEL_AIO,                              0 );

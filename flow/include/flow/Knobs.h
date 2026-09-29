@@ -281,6 +281,10 @@ public:
 	int KAIO_MAX_IO_BYTES;
 	// If > 0, io_submit() is called with at most this many iocbs at a time.
 	int KAIO_MAX_IOCBS_PER_SUBMIT;
+	// If true, AsyncFileKAIO::sync() is a kernel AIO fdatasync (IOCB_CMD_FDSYNC, Linux 4.18+) completed through
+	// the KAIO eventfd, instead of an fdatasync() handed to the EIO thread pool. Falls back to the thread pool
+	// if the kernel or filesystem rejects it.
+	bool KAIO_FDSYNC;
 
 	int PAGE_WRITE_CHECKSUM_HISTORY;
 	int DISABLE_POSIX_KERNEL_AIO;

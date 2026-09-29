@@ -221,6 +221,86 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/SplitLargeIO") {
 	}
 }
 
+// With KAIO_FDSYNC, sync() must be a kernel AIO fdatasync (no fallback on a kernel and filesystem that support
+// it), interleave correctly with writes, and leave the EIO path in use when the knob is off. A rejected fdsync
+// must fall back to the thread pool and disable further attempts.
+TEST_CASE("/fdbrpc/AsyncFileKAIO/Fdsync") {
+	if (g_network->isSimulated()) {
+		co_return;
+	}
+	auto* knobs = const_cast<FlowKnobs*>(FLOW_KNOBS);
+	const bool savedFdsync = knobs->KAIO_FDSYNC;
+	constexpr int length = 64 << 10;
+	constexpr int rounds = 200;
+	uint8_t* wbuf = static_cast<uint8_t*>(allocateFast4kAligned(length));
+	uint8_t* rbuf = static_cast<uint8_t*>(allocateFast4kAligned(length));
+	const std::string filename =
+	    format("/tmp/__KAIO_FDSYNC_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str());
+	Reference<IAsyncFile> f;
+	Optional<Error> err;
+	try {
+		f = co_await AsyncFileKAIO::open(filename,
+		                                 IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE |
+		                                     IAsyncFile::OPEN_CREATE,
+		                                 0666,
+		                                 nullptr);
+		std::vector<uint8_t> expected(rounds * length);
+
+		knobs->KAIO_FDSYNC = true;
+		AsyncFileKAIO::resetFdsyncStats();
+		for (int i = 0; i < rounds; i++) {
+			for (int j = 0; j < length; j++) {
+				wbuf[j] = static_cast<uint8_t>(deterministicRandom()->randomInt(0, 256));
+			}
+			const int slot = deterministicRandom()->randomInt(0, rounds);
+			co_await f->write(wbuf, length, static_cast<int64_t>(slot) * length);
+			memcpy(expected.data() + static_cast<size_t>(slot) * length, wbuf, length);
+			co_await f->sync();
+		}
+		auto st = AsyncFileKAIO::getFdsyncStats();
+		ASSERT_EQ(st.submitted, rounds);
+		ASSERT_EQ(st.fallbacks, 0);
+		ASSERT(st.supported);
+		for (int slot = 0; slot < rounds; slot++) {
+			const int n = co_await f->read(rbuf, length, static_cast<int64_t>(slot) * length);
+			ASSERT_EQ(n, length);
+			ASSERT(memcmp(rbuf, expected.data() + static_cast<size_t>(slot) * length, length) == 0);
+		}
+
+		// Knob off: syncs go to the EIO thread pool.
+		knobs->KAIO_FDSYNC = false;
+		co_await f->write(wbuf, length, 0);
+		co_await f->sync();
+		ASSERT_EQ(AsyncFileKAIO::getFdsyncStats().submitted, rounds);
+
+		// A rejected fdsync (what io_submit reports on kernels before 4.18) falls back and disables fdsync.
+		knobs->KAIO_FDSYNC = true;
+		co_await AsyncFileKAIO::fdsyncOrFallback(Future<int>(AsyncFileKAIO::kFdsyncUnsupported),
+		                                         static_cast<int>(f->debugFD()));
+		st = AsyncFileKAIO::getFdsyncStats();
+		ASSERT_EQ(st.fallbacks, 1);
+		ASSERT(!st.supported);
+		co_await f->write(wbuf, length, 0);
+		co_await f->sync();
+		ASSERT_EQ(AsyncFileKAIO::getFdsyncStats().submitted, rounds);
+		const int n = co_await f->read(rbuf, length, 0);
+		ASSERT_EQ(n, length);
+		ASSERT(memcmp(rbuf, wbuf, length) == 0);
+	} catch (Error& e) {
+		err = e;
+	}
+	knobs->KAIO_FDSYNC = savedFdsync;
+	AsyncFileKAIO::resetFdsyncStats();
+	freeFast4kAligned(length, wbuf);
+	freeFast4kAligned(length, rbuf);
+	if (f) {
+		co_await AsyncFileEIO::deleteFile(filename, true);
+	}
+	if (err.present()) {
+		throw err.get();
+	}
+}
+
 // Many concurrent reads and writes of random sizes and offsets, under random KAIO split settings, must read back
 // exactly what an in-memory copy of the file holds. Writes in one round never overlap, so their completion order
 // does not matter.
