@@ -245,6 +245,7 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/Fdsync") {
 		                                 0666,
 		                                 nullptr);
 		std::vector<uint8_t> expected(rounds * length);
+		co_await f->truncate(static_cast<int64_t>(rounds) * length);
 
 		knobs->KAIO_FDSYNC = true;
 		AsyncFileKAIO::resetFdsyncStats();
