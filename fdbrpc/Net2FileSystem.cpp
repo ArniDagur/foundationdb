@@ -221,15 +221,15 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/SplitLargeIO") {
 	}
 }
 
-// With KAIO_FDSYNC, sync() must be a kernel AIO fdatasync (no fallback on a kernel and filesystem that support
-// it), interleave correctly with writes, and leave the EIO path in use when the knob is off. A rejected fdsync
-// must fall back to the thread pool and disable further attempts.
+// With KAIO_FDSYNC = 1 (kernel AIO) or 2 (io_uring), sync() must take that path (no fallback on a kernel and
+// filesystem that support it) and interleave correctly with writes; with 0 it must stay on the EIO thread pool.
+// A rejected fdsync must fall back to the thread pool and disable further attempts.
 TEST_CASE("/fdbrpc/AsyncFileKAIO/Fdsync") {
 	if (g_network->isSimulated()) {
 		co_return;
 	}
 	auto* knobs = const_cast<FlowKnobs*>(FLOW_KNOBS);
-	const bool savedFdsync = knobs->KAIO_FDSYNC;
+	const int savedFdsync = knobs->KAIO_FDSYNC;
 	constexpr int length = 64 << 10;
 	constexpr int rounds = 200;
 	uint8_t* wbuf = static_cast<uint8_t*>(allocateFast4kAligned(length));
@@ -247,43 +247,46 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/Fdsync") {
 		std::vector<uint8_t> expected(rounds * length);
 		co_await f->truncate(static_cast<int64_t>(rounds) * length);
 
-		knobs->KAIO_FDSYNC = true;
-		AsyncFileKAIO::resetFdsyncStats();
-		for (int i = 0; i < rounds; i++) {
-			for (int j = 0; j < length; j++) {
-				wbuf[j] = static_cast<uint8_t>(deterministicRandom()->randomInt(0, 256));
+		for (int mode : { 1, 2 }) {
+			knobs->KAIO_FDSYNC = mode;
+			AsyncFileKAIO::resetFdsyncStats();
+			for (int i = 0; i < rounds; i++) {
+				for (int j = 0; j < length; j++) {
+					wbuf[j] = static_cast<uint8_t>(deterministicRandom()->randomInt(0, 256));
+				}
+				const int slot = deterministicRandom()->randomInt(0, rounds);
+				co_await f->write(wbuf, length, static_cast<int64_t>(slot) * length);
+				memcpy(expected.data() + static_cast<size_t>(slot) * length, wbuf, length);
+				co_await f->sync();
 			}
-			const int slot = deterministicRandom()->randomInt(0, rounds);
-			co_await f->write(wbuf, length, static_cast<int64_t>(slot) * length);
-			memcpy(expected.data() + static_cast<size_t>(slot) * length, wbuf, length);
-			co_await f->sync();
-		}
-		auto st = AsyncFileKAIO::getFdsyncStats();
-		ASSERT_EQ(st.submitted, rounds);
-		ASSERT_EQ(st.fallbacks, 0);
-		ASSERT(st.supported);
-		for (int slot = 0; slot < rounds; slot++) {
-			const int n = co_await f->read(rbuf, length, static_cast<int64_t>(slot) * length);
-			ASSERT_EQ(n, length);
-			ASSERT(memcmp(rbuf, expected.data() + static_cast<size_t>(slot) * length, length) == 0);
+			auto st = AsyncFileKAIO::getFdsyncStats();
+			ASSERT_EQ(st.submitted, rounds);
+			ASSERT_EQ(st.fallbacks, 0);
+			ASSERT(st.supported);
+			for (int slot = 0; slot < rounds; slot++) {
+				const int n = co_await f->read(rbuf, length, static_cast<int64_t>(slot) * length);
+				ASSERT_EQ(n, length);
+				ASSERT(memcmp(rbuf, expected.data() + static_cast<size_t>(slot) * length, length) == 0);
+			}
 		}
 
-		// Knob off: syncs go to the EIO thread pool.
-		knobs->KAIO_FDSYNC = false;
+		// Mode 0: syncs go to the EIO thread pool.
+		knobs->KAIO_FDSYNC = 0;
+		AsyncFileKAIO::resetFdsyncStats();
 		co_await f->write(wbuf, length, 0);
 		co_await f->sync();
-		ASSERT_EQ(AsyncFileKAIO::getFdsyncStats().submitted, rounds);
+		ASSERT_EQ(AsyncFileKAIO::getFdsyncStats().submitted, 0);
 
 		// A rejected fdsync (what io_submit reports on kernels before 4.18) falls back and disables fdsync.
-		knobs->KAIO_FDSYNC = true;
+		knobs->KAIO_FDSYNC = 1;
 		co_await AsyncFileKAIO::fdsyncOrFallback(Future<int>(AsyncFileKAIO::kFdsyncUnsupported),
 		                                         static_cast<int>(f->debugFD()));
-		st = AsyncFileKAIO::getFdsyncStats();
+		auto st = AsyncFileKAIO::getFdsyncStats();
 		ASSERT_EQ(st.fallbacks, 1);
 		ASSERT(!st.supported);
 		co_await f->write(wbuf, length, 0);
 		co_await f->sync();
-		ASSERT_EQ(AsyncFileKAIO::getFdsyncStats().submitted, rounds);
+		ASSERT_EQ(AsyncFileKAIO::getFdsyncStats().submitted, 0);
 		const int n = co_await f->read(rbuf, length, 0);
 		ASSERT_EQ(n, length);
 		ASSERT(memcmp(rbuf, wbuf, length) == 0);

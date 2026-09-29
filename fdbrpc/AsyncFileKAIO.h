@@ -28,6 +28,9 @@
 #include <sys/stat.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
+#include <linux/io_uring.h>
+#include <atomic>
 #include <type_traits>
 #include "linux_kaio.h"
 #include "flow/Knobs.h"
@@ -417,9 +420,19 @@ public:
 		double start_time = timer();
 
 		Future<Void> fsync;
-		if (FLOW_KNOBS->KAIO_FDSYNC && ctx.fdsyncSupported) {
-			// Callers only sync after their writes have completed, so ordering against in-flight iocbs is not
-			// needed; the kernel runs the fdatasync on a workqueue and completes it through the KAIO eventfd.
+		const int mode = FLOW_KNOBS->KAIO_FDSYNC;
+		if (mode == 2 && ctx.fdsyncSupported && uringReady()) {
+			// Callers only sync after their writes have completed, so no ordering against in-flight iocbs is
+			// needed. The completion is posted to the KAIO eventfd and reaped by poll().
+			IOBlock* io = new IOBlock(IO_CMD_FDSYNC, fd);
+			io->owner = Reference<AsyncFileKAIO>::addRef(this);
+			io->prio = int64_t(g_network->getCurrentTask()) << 32;
+			Future<int> r = io->result.getFuture();
+			++ctx.fdsyncSubmitted;
+			uringSubmitFsync(io);
+			fsync = throwErrorIfFailed(Reference<AsyncFileKAIO>::addRef(this), fdsyncOrFallback(r, fd));
+		} else if (mode == 1 && ctx.fdsyncSupported) {
+			// As above; the kernel runs the fdatasync on the submitting CPU's workqueue.
 			IOBlock* io = new IOBlock(IO_CMD_FDSYNC, fd);
 			enqueue(io, "sync", this);
 			++ctx.fdsyncSubmitted;
@@ -445,7 +458,7 @@ public:
 
 		return fsync;
 	}
-	// Result a rejected IOCB_CMD_FDSYNC is delivered as; a successful one completes with 0.
+	// Result a rejected fdsync is delivered as; a successful one completes with 0.
 	static constexpr int kFdsyncUnsupported = 1;
 
 	// Kernels before 4.18, and filesystems without aio fsync, reject IOCB_CMD_FDSYNC with EINVAL; from then on
@@ -694,6 +707,118 @@ private:
 		}
 	};
 
+	// A minimal io_uring used only for fsyncs (KAIO_FDSYNC=2), driven with raw syscalls. Its completions are
+	// signalled on the KAIO eventfd so the existing poll() loop reaps them.
+	struct URing {
+		int fd = -1;
+		bool tried = false;
+		unsigned* sqHead = nullptr;
+		unsigned* sqTail = nullptr;
+		unsigned* sqMask = nullptr;
+		unsigned* sqArray = nullptr;
+		io_uring_sqe* sqes = nullptr;
+		unsigned* cqHead = nullptr;
+		unsigned* cqTail = nullptr;
+		unsigned* cqMask = nullptr;
+		io_uring_cqe* cqes = nullptr;
+		int inflight = 0;
+	};
+
+	static bool uringReady() {
+		URing& u = ctx.uring;
+		if (u.tried) {
+			return u.fd >= 0;
+		}
+		u.tried = true;
+		io_uring_params p;
+		memset(&p, 0, sizeof(p));
+		const int fd = syscall(__NR_io_uring_setup, FLOW_KNOBS->MAX_OUTSTANDING, &p);
+		if (fd < 0) {
+			TraceEvent(SevWarnAlways, "AsyncFileKAIOUringSetupFailed").GetLastError();
+			return false;
+		}
+		const size_t sqSize = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+		const size_t cqSize = p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe);
+		const bool single = p.features & IORING_FEAT_SINGLE_MMAP;
+		void* sq = mmap(nullptr,
+		                single ? std::max(sqSize, cqSize) : sqSize,
+		                PROT_READ | PROT_WRITE,
+		                MAP_SHARED | MAP_POPULATE,
+		                fd,
+		                IORING_OFF_SQ_RING);
+		void* cq =
+		    single ? sq
+		           : mmap(nullptr, cqSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
+		void* sqes = mmap(nullptr,
+		                  p.sq_entries * sizeof(io_uring_sqe),
+		                  PROT_READ | PROT_WRITE,
+		                  MAP_SHARED | MAP_POPULATE,
+		                  fd,
+		                  IORING_OFF_SQES);
+		int evfd = ctx.evfd;
+		if (sq == MAP_FAILED || cq == MAP_FAILED || sqes == MAP_FAILED ||
+		    syscall(__NR_io_uring_register, fd, IORING_REGISTER_EVENTFD, &evfd, 1) < 0) {
+			TraceEvent(SevWarnAlways, "AsyncFileKAIOUringInitFailed").GetLastError();
+			close(fd);
+			return false;
+		}
+		char* sqp = static_cast<char*>(sq);
+		char* cqp = static_cast<char*>(cq);
+		u.sqHead = reinterpret_cast<unsigned*>(sqp + p.sq_off.head);
+		u.sqTail = reinterpret_cast<unsigned*>(sqp + p.sq_off.tail);
+		u.sqMask = reinterpret_cast<unsigned*>(sqp + p.sq_off.ring_mask);
+		u.sqArray = reinterpret_cast<unsigned*>(sqp + p.sq_off.array);
+		u.sqes = static_cast<io_uring_sqe*>(sqes);
+		u.cqHead = reinterpret_cast<unsigned*>(cqp + p.cq_off.head);
+		u.cqTail = reinterpret_cast<unsigned*>(cqp + p.cq_off.tail);
+		u.cqMask = reinterpret_cast<unsigned*>(cqp + p.cq_off.ring_mask);
+		u.cqes = reinterpret_cast<io_uring_cqe*>(cqp + p.cq_off.cqes);
+		u.fd = fd;
+		TraceEvent("AsyncFileKAIOUringReady").detail("SQEntries", p.sq_entries).detail("CQEntries", p.cq_entries);
+		return true;
+	}
+
+	static void uringSubmitFsync(IOBlock* io) {
+		URing& u = ctx.uring;
+		const unsigned tail = *u.sqTail;
+		const unsigned idx = tail & *u.sqMask;
+		io_uring_sqe* sqe = &u.sqes[idx];
+		memset(sqe, 0, sizeof(*sqe));
+		sqe->opcode = IORING_OP_FSYNC;
+		sqe->fd = io->aio_fildes;
+		sqe->fsync_flags = IORING_FSYNC_DATASYNC;
+		sqe->user_data = reinterpret_cast<uint64_t>(io);
+		u.sqArray[idx] = idx;
+		std::atomic_ref<unsigned>(*u.sqTail).store(tail + 1, std::memory_order_release);
+		// At most one fsync per file is outstanding, far below the ring size, so the SQ cannot be full.
+		const int rc = syscall(__NR_io_uring_enter, u.fd, 1, 0, 0, nullptr, 0);
+		if (rc < 1) {
+			// The kernel did not consume the entry; take it back and fail this sync.
+			std::atomic_ref<unsigned>(*u.sqTail).store(tail, std::memory_order_release);
+			io->setResult(rc < 0 ? -errno : -EAGAIN);
+			return;
+		}
+		++u.inflight;
+	}
+
+	static void uringReap() {
+		URing& u = ctx.uring;
+		if (u.fd < 0 || !u.inflight) {
+			return;
+		}
+		unsigned head = *u.cqHead;
+		const unsigned tail = std::atomic_ref<unsigned>(*u.cqTail).load(std::memory_order_acquire);
+		while (head != tail) {
+			const io_uring_cqe& cqe = u.cqes[head & *u.cqMask];
+			IOBlock* io = reinterpret_cast<IOBlock*>(cqe.user_data);
+			const int res = cqe.res;
+			++head;
+			--u.inflight;
+			io->setResult(res);
+		}
+		std::atomic_ref<unsigned>(*u.cqHead).store(head, std::memory_order_release);
+	}
+
 	struct Context {
 		io_context_t iocx;
 		int evfd;
@@ -704,6 +829,7 @@ private:
 		bool fdsyncSupported;
 		int64_t fdsyncSubmitted;
 		int64_t fdsyncFallbacks;
+		URing uring;
 		std::priority_queue<IOBlock*, std::vector<IOBlock*>, IOBlock::indirect_order_by_priority> queue;
 		Int64MetricHandle countAIOSubmit;
 		Int64MetricHandle countAIOCollect;
@@ -939,6 +1065,7 @@ private:
 
 				iob->setResult(events[i].result);
 			}
+			uringReap();
 		}
 	}
 };
