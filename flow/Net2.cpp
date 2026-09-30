@@ -835,6 +835,27 @@ public:
 
 using ssl_socket = boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>;
 
+// Runs a blocking handshake directly with OpenSSL on a socket that OpenSSL owns (SSLConnection with kTLS).
+static void opensslHandshake(SSL* ssl, ssl_socket::handshake_type type, boost::system::error_code& err) {
+	if (type == ssl_socket::handshake_type::client) {
+		SSL_set_connect_state(ssl);
+	} else {
+		SSL_set_accept_state(ssl);
+	}
+	ERR_clear_error();
+	errno = 0;
+	if (SSL_do_handshake(ssl) == 1) {
+		return;
+	}
+	if (const unsigned long e = ERR_get_error(); e != 0) {
+		err = boost::system::error_code(static_cast<int>(e), boost::asio::error::get_ssl_category());
+	} else if (errno != 0) {
+		err = boost::system::error_code(errno, boost::system::system_category());
+	} else {
+		err = boost::asio::ssl::error::stream_truncated;
+	}
+}
+
 struct SSLHandshakerThread final : IThreadPoolReceiver {
 	SSLHandshakerThread() = default;
 	void init() override {}
@@ -860,13 +881,18 @@ struct SSLHandshakerThread final : IThreadPoolReceiver {
 		ssl_socket::handshake_type type;
 		boost::system::error_code err;
 		NetworkAddress peerAddr;
+		bool opensslOwnsSocket = false;
 	};
 
 	void action(Handshake& h) {
 		try {
 			h.socket.next_layer().non_blocking(false, h.err);
 			if (!h.err.failed()) {
-				h.socket.handshake(h.type, h.err);
+				if (h.opensslOwnsSocket) {
+					opensslHandshake(h.socket.native_handle(), h.type, h.err);
+				} else {
+					h.socket.handshake(h.type, h.err);
+				}
 			}
 			if (!h.err.failed()) {
 				h.socket.next_layer().non_blocking(true, h.err);
@@ -978,6 +1004,7 @@ public:
 			                   self->ssl_sock,
 			                   self->peer_address,
 			                   [conn = self.getPtr()](bool verifyOk) { conn->has_trusted_peer = verifyOk; });
+			self->prepareKtls();
 
 			// If the background handshakers are not all busy, use one
 			// FIXME: see comment elsewhere about making this the only path.
@@ -990,6 +1017,7 @@ public:
 				auto handshake =
 				    new SSLHandshakerThread::Handshake(self->ssl_sock, boost::asio::ssl::stream_base::server);
 				handshake->setPeerAddr(self->getPeerAddress());
+				handshake->opensslOwnsSocket = self->opensslOwnsSocket;
 				onHandshook = handshake->done.getFuture();
 				N2::g_net2->sslHandshakerPool->post(handshake);
 			} else {
@@ -997,11 +1025,16 @@ public:
 				static SimpleCounter<int64_t>* countServerTLSHandshakesOnMainThread =
 				    SimpleCounter<int64_t>::makeCounter("/Net2/TLS/ServerTLSHandshakesOnMainThread");
 				countServerTLSHandshakesOnMainThread->increment(1);
-				BindPromise p("N2_AcceptHandshakeError"_audit, self->id, self->getPeerAddress());
-				onHandshook = p.getFuture();
-				self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::server, std::move(p));
+				if (self->opensslOwnsSocket) {
+					onHandshook = opensslHandshakeOnNetworkThread(self, boost::asio::ssl::stream_base::server);
+				} else {
+					BindPromise p("N2_AcceptHandshakeError"_audit, self->id, self->getPeerAddress());
+					onHandshook = p.getFuture();
+					self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::server, std::move(p));
+				}
 			}
 			co_await onHandshook;
+			self->noteKtlsState();
 			co_await delay(0, TaskPriority::Handshake);
 			connected.send(Void());
 		} catch (...) {
@@ -1092,6 +1125,7 @@ public:
 				    .detail("Result", result)
 				    .detail("Addr", self->peer_address);
 			}
+			self->prepareKtls();
 
 			// If the background handshakers are not all busy, use one
 
@@ -1111,6 +1145,7 @@ public:
 				auto handshake =
 				    new SSLHandshakerThread::Handshake(self->ssl_sock, boost::asio::ssl::stream_base::client);
 				handshake->setPeerAddr(self->getPeerAddress());
+				handshake->opensslOwnsSocket = self->opensslOwnsSocket;
 				onHandshook = handshake->done.getFuture();
 				N2::g_net2->sslHandshakerPool->post(handshake);
 			} else {
@@ -1118,11 +1153,16 @@ public:
 				static SimpleCounter<int64_t>* countClientTLSHandshakesOnMainThread =
 				    SimpleCounter<int64_t>::makeCounter("/Net2/TLS/ClientTLSHandshakesOnMainThread");
 				countClientTLSHandshakesOnMainThread->increment(1);
-				BindPromise p("N2_ConnectHandshakeError"_audit, self->id, self->getPeerAddress());
-				onHandshook = p.getFuture();
-				self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::client, std::move(p));
+				if (self->opensslOwnsSocket) {
+					onHandshook = opensslHandshakeOnNetworkThread(self, boost::asio::ssl::stream_base::client);
+				} else {
+					BindPromise p("N2_ConnectHandshakeError"_audit, self->id, self->getPeerAddress());
+					onHandshook = p.getFuture();
+					self->ssl_sock.async_handshake(boost::asio::ssl::stream_base::client, std::move(p));
+				}
 			}
 			co_await onHandshook;
+			self->noteKtlsState();
 			co_await delay(0, TaskPriority::Handshake);
 			connected.send(Void());
 		} catch (...) {
@@ -1196,7 +1236,8 @@ public:
 		boost::system::error_code err;
 		++g_net2->countReads;
 		size_t toRead = end - begin;
-		size_t size = ssl_sock.read_some(boost::asio::mutable_buffer(begin, toRead), err);
+		size_t size = opensslOwnsSocket ? opensslRead(begin, toRead, err)
+		                                : ssl_sock.read_some(boost::asio::mutable_buffer(begin, toRead), err);
 		g_net2->bytesReceived += size;
 		//TraceEvent("ConnRead", this->id).detail("Bytes", size);
 		if (err) {
@@ -1223,8 +1264,18 @@ public:
 		boost::system::error_code err;
 		++g_net2->countWrites;
 
-		size_t sent = ssl_sock.write_some(
-		    boost::iterator_range<SendBufferIterator>(SendBufferIterator(data, limit), SendBufferIterator()), err);
+		size_t sent;
+		if (ktlsSend) {
+			// The kernel frames and encrypts whatever is written to the socket, so the whole chain goes out in one
+			// sendmsg.
+			sent = socket.write_some(
+			    boost::iterator_range<SendBufferIterator>(SendBufferIterator(data, limit), SendBufferIterator()), err);
+		} else if (opensslOwnsSocket) {
+			sent = opensslWrite(data, limit, err);
+		} else {
+			sent = ssl_sock.write_some(
+			    boost::iterator_range<SendBufferIterator>(SendBufferIterator(data, limit), SendBufferIterator()), err);
+		}
 
 		if (err) {
 			// Since there was an error, sent's value can't be used to infer that the buffer has data and the limit is
@@ -1270,6 +1321,11 @@ private:
 	Reference<ReferencedObject<boost::asio::ssl::context>> sslContext;
 	bool has_trusted_peer;
 	std::string sni_hostname; // For Server Name Indication
+	// With FLOW_KNOBS->TLS_USE_KTLS, OpenSSL owns the socket instead of Asio's in-memory BIO pair: the handshake and
+	// reads go through OpenSSL directly, and OpenSSL hands the traffic keys to the kernel when they switch.
+	bool opensslOwnsSocket = false;
+	// Set after the handshake: the kernel encrypts sends, so writes bypass OpenSSL.
+	bool ktlsSend = false;
 
 	void init() {
 		// Socket settings that have to be set after connect or accept succeeds
@@ -1278,13 +1334,138 @@ private:
 		platform::setCloseOnExec(socket.native_handle());
 	}
 
+	// Must be called before the handshake starts.
+	void prepareKtls() {
+#if defined(__linux__) && defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+		if (!FLOW_KNOBS->TLS_USE_KTLS) {
+			return;
+		}
+		SSL* ssl = ssl_sock.native_handle();
+		SSL_set_options(ssl, SSL_OP_ENABLE_KTLS);
+		opensslOwnsSocket = SSL_set_fd(ssl, socket.native_handle()) == 1;
+#endif
+	}
+
+	void noteKtlsState() {
+#if defined(__linux__) && defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+		if (!opensslOwnsSocket) {
+			return;
+		}
+		SSL* ssl = ssl_sock.native_handle();
+		ktlsSend = BIO_get_ktls_send(SSL_get_wbio(ssl)) > 0;
+		const bool ktlsRecv = BIO_get_ktls_recv(SSL_get_rbio(ssl)) > 0;
+		static SimpleCounter<int64_t>* countKtlsSend = SimpleCounter<int64_t>::makeCounter("/Net2/TLS/KtlsSend");
+		static SimpleCounter<int64_t>* countKtlsRecv = SimpleCounter<int64_t>::makeCounter("/Net2/TLS/KtlsRecv");
+		static SimpleCounter<int64_t>* countUserspaceTls =
+		    SimpleCounter<int64_t>::makeCounter("/Net2/TLS/KtlsUnavailable");
+		countKtlsSend->increment(ktlsSend);
+		countKtlsRecv->increment(ktlsRecv);
+		countUserspaceTls->increment(!ktlsSend && !ktlsRecv);
+		TraceEvent("N2_TLSKernelOffload", id)
+		    .suppressFor(60.0)
+		    .detail("PeerAddress", peer_address)
+		    .detail("Version", SSL_get_version(ssl))
+		    .detail("Cipher", SSL_get_cipher(ssl))
+		    .detail("Send", ktlsSend)
+		    .detail("Recv", ktlsRecv);
+#endif
+	}
+
+	static Future<Void> opensslHandshakeOnNetworkThread(Reference<SSLConnection> self,
+	                                                    ssl_socket::handshake_type type) {
+		SSL* ssl = self->ssl_sock.native_handle();
+		if (type == ssl_socket::handshake_type::client) {
+			SSL_set_connect_state(ssl);
+		} else {
+			SSL_set_accept_state(ssl);
+		}
+		while (true) {
+			ERR_clear_error();
+			const int rc = SSL_do_handshake(ssl);
+			if (rc == 1) {
+				co_return;
+			}
+			const int e = SSL_get_error(ssl, rc);
+			if (e == SSL_ERROR_WANT_READ) {
+				co_await self->onReadable();
+			} else if (e == SSL_ERROR_WANT_WRITE) {
+				co_await self->onWritable();
+			} else {
+				TraceEvent(SevWarn,
+				           type == ssl_socket::handshake_type::client ? "N2_ConnectHandshakeError"_audit
+				                                                      : "N2_AcceptHandshakeError"_audit)
+				    .detail("PeerAddr", self->peer_address)
+				    .detail("PeerAddress", self->peer_address)
+				    .detail("SSLError", e)
+				    .detail("ErrorCode", ERR_peek_error());
+				throw connection_failed();
+			}
+		}
+	}
+
+	// SSL_read on the socket OpenSSL owns; returns 0 with err set, like ssl_socket::read_some.
+	size_t opensslRead(uint8_t* begin, size_t toRead, boost::system::error_code& err) {
+		SSL* ssl = ssl_sock.native_handle();
+		ERR_clear_error();
+		errno = 0;
+		const int n = SSL_read(ssl, begin, static_cast<int>(std::min<size_t>(toRead, INT_MAX)));
+		if (n > 0) {
+			return n;
+		}
+		opensslError(ssl, n, /*reading=*/true, err);
+		return 0;
+	}
+
+	// SSL_write of the first unsent buffer of the chain, like ssl_socket::write_some. Used when the kernel does not
+	// encrypt sends for this connection.
+	size_t opensslWrite(SendBuffer const* data, int limit, boost::system::error_code& err) {
+		while (data && data->bytes_written == data->bytes_sent) {
+			data = data->next;
+		}
+		ASSERT(data && limit > 0);
+		SSL* ssl = ssl_sock.native_handle();
+		ERR_clear_error();
+		errno = 0;
+		const int n =
+		    SSL_write(ssl, data->data() + data->bytes_sent, std::min(limit, data->bytes_written - data->bytes_sent));
+		if (n > 0) {
+			return n;
+		}
+		opensslError(ssl, n, /*reading=*/false, err);
+		return 0;
+	}
+
+	// Maps a failed SSL_read (reading) or SSL_write to an error code. Only the operation's own direction means "try
+	// again when the socket is ready". The other one would need OpenSSL to write while reading (a TLS 1.3 KeyUpdate
+	// response) or the reverse, which the readiness loop here does not drive, so it fails the connection.
+	static void opensslError(SSL* ssl, int rc, bool reading, boost::system::error_code& err) {
+		const int e = SSL_get_error(ssl, rc);
+		if (e == (reading ? SSL_ERROR_WANT_READ : SSL_ERROR_WANT_WRITE)) {
+			err = boost::asio::error::would_block;
+		} else if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+			err = boost::asio::ssl::error::unexpected_result;
+		} else if (e == SSL_ERROR_ZERO_RETURN) {
+			err = boost::asio::error::eof;
+		} else if (const unsigned long code = ERR_get_error(); code != 0) {
+			err = boost::system::error_code(static_cast<int>(code), boost::asio::error::get_ssl_category());
+		} else if (errno != 0) {
+			err = boost::system::error_code(errno, boost::system::system_category());
+		} else {
+			err = boost::asio::ssl::error::stream_truncated;
+		}
+	}
+
 	void closeSocket() {
 		boost::system::error_code cancelError;
 		socket.cancel(cancelError);
 		boost::system::error_code closeError;
 		socket.close(closeError);
-		boost::system::error_code shutdownError;
-		ssl_sock.shutdown(shutdownError);
+		// When OpenSSL owns the socket, shutting it down would write close_notify straight to the closed (and possibly
+		// reused) descriptor.
+		if (!opensslOwnsSocket) {
+			boost::system::error_code shutdownError;
+			ssl_sock.shutdown(shutdownError);
+		}
 	}
 
 	void onReadError(const boost::system::error_code& error) {
