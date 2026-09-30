@@ -632,7 +632,7 @@ private:
 		// Completion of this request when it was submitted to the network thread's io_uring (KAIO_IO_URING).
 		struct UringOp final : iouring::Op {
 			IOBlock* io = nullptr;
-			void complete(int32_t res) override { AsyncFileKAIO::ringCompleted(io, res); }
+			void complete(int32_t res, uint32_t) override { AsyncFileKAIO::ringCompleted(io, res); }
 		};
 
 		Promise<int> result;

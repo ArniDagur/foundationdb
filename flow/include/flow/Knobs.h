@@ -241,7 +241,10 @@ public:
 	// Proof of concept: KAIO reads, writes and fsyncs go through the network thread's io_uring instead of libaio.
 	bool KAIO_IO_URING;
 	int IO_URING_ENTRIES; // submission queue entries of the network thread's io_uring
-	int NET_IO_URING_RECV_BYTES; // receive buffer per connection with NET_IO_URING
+	int NET_IO_URING_RECV_BYTES; // size of each NET_IO_URING receive buffer
+	int NET_IO_URING_RECV_BUFFERS; // provided receive buffers shared by all connections (multishot receives)
+	bool NET_IO_URING_MULTISHOT; // multishot receives into provided buffers where the kernel has them, else one
+	                             // receive per connection into its own buffer
 	double IO_URING_METRICS_INTERVAL; // seconds between IoUringMetrics trace events
 
 	int NETWORK_TEST_CLIENT_COUNT;

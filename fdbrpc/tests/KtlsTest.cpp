@@ -29,9 +29,12 @@
 //
 // With --net-io-uring (FLOW_KNOBS->NET_IO_URING), plain TCP connections and TLS connections whose records the kernel
 // handles in both directions must move their data through the network thread's io_uring (its receive and send
-// completion counters grow), and every other TLS connection must not touch it.
+// completion counters grow) and leave Asio's epoll set, and every other TLS connection must not touch the ring. Where
+// the kernel provides buffer rings (6.1+ here), receives must be multishot (more completions than submissions) unless
+// --no-multishot; --recv-buffers=N shrinks the shared buffer pool so that receives run out of buffers and resume.
 //
-//   ktls_unittest [--net-io-uring] [--main-thread-handshakes] [--openssl-conf=tls12|cbc]
+//   ktls_unittest [--net-io-uring [--no-multishot] [--recv-buffers=N]] [--main-thread-handshakes]
+//                 [--openssl-conf=tls12|cbc]
 
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +51,7 @@
 #include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
+#include <dirent.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -213,6 +217,42 @@ int64_t ringSocketCompletions() {
 	return ring->stats().completed[int(iouring::Kind::NetRecv)] + ring->stats().completed[int(iouring::Kind::NetSend)];
 }
 
+int64_t ringCount(bool submitted, iouring::Kind kind) {
+	iouring::Ring* ring = iouring::Ring::existing();
+	if (!ring) {
+		return 0;
+	}
+	return (submitted ? ring->stats().submitted : ring->stats().completed)[int(kind)];
+}
+
+// Whether any epoll instance of this process watches fd (from the tfd lines of /proc/self/fdinfo).
+bool inAnyEpollSet(int fd) {
+	bool found = false;
+	DIR* dir = opendir("/proc/self/fd");
+	while (dirent* e = dir ? readdir(dir) : nullptr) {
+		char target[64] = {};
+		const std::string link = std::string("/proc/self/fd/") + e->d_name;
+		if (readlink(link.c_str(), target, sizeof(target) - 1) <= 0 || strcmp(target, "anon_inode:[eventpoll]") != 0) {
+			continue;
+		}
+		FILE* info = std::fopen((std::string("/proc/self/fdinfo/") + e->d_name).c_str(), "r");
+		char line[256];
+		while (info && std::fgets(line, sizeof(line), info)) {
+			int tfd = -1;
+			if (std::sscanf(line, "tfd: %d", &tfd) == 1 && tfd == fd) {
+				found = true;
+			}
+		}
+		if (info) {
+			std::fclose(info);
+		}
+	}
+	if (dir) {
+		closedir(dir);
+	}
+	return found;
+}
+
 Future<std::string> receiveAll(Reference<IConnection> conn, int size) {
 	std::string got(size, '\0');
 	int have = 0;
@@ -349,6 +389,8 @@ runOne(bool tls, bool useKtls, bool expectKernel, bool expectRing, std::string m
 	const std::string label =
 	    tls ? mode + (useKtls ? " knob on" : " knob off") : (FLOW_KNOBS->NET_IO_URING ? "tcp io_uring" : "tcp");
 	const int64_t ringBefore = ringSocketCompletions();
+	const int64_t recvSubmittedBefore = ringCount(true, iouring::Kind::NetRecv);
+	const int64_t recvCompletedBefore = ringCount(false, iouring::Kind::NetRecv);
 
 	Reference<IListener> listener =
 	    INetworkConnections::net()->listen(NetworkAddress::parse(tls ? "127.0.0.1:0:tls" : "127.0.0.1:0"));
@@ -368,6 +410,11 @@ runOne(bool tls, bool useKtls, bool expectKernel, bool expectRing, std::string m
 		check(c.tx && c.rx && s.tx && s.rx, label + ": kernel send and receive keys on both ends");
 	} else {
 		check(!c.tx && !c.rx && !s.tx && !s.rx, label + ": user-space TLS when the kernel cannot take the cipher");
+	}
+	if (expectRing) {
+		check(!inAnyEpollSet(client->getSocket().native_handle()) &&
+		          !inAnyEpollSet(server->getSocket().native_handle()),
+		      label + ": neither socket is in an epoll set");
 	}
 
 	for (int size : { 1, 100, 4000, 16383, 16384, 16385, 65537, 1 << 20, 3 << 20 }) {
@@ -412,6 +459,15 @@ runOne(bool tls, bool useKtls, bool expectKernel, bool expectRing, std::string m
 		check(ringCompletions > 0,
 		      label + ": data went through io_uring (" + std::to_string(ringCompletions) +
 		          " receive and send completions)");
+		const int64_t recvSubmitted = ringCount(true, iouring::Kind::NetRecv) - recvSubmittedBefore;
+		const int64_t recvCompleted = ringCount(false, iouring::Kind::NetRecv) - recvCompletedBefore;
+		const std::string counts =
+		    std::to_string(recvSubmitted) + " submitted, " + std::to_string(recvCompleted) + " completed";
+		if (iouring::Ring::existing()->hasBufferRing()) {
+			check(recvCompleted > recvSubmitted, label + ": multishot receives (" + counts + ")");
+		} else {
+			check(recvCompleted <= recvSubmitted, label + ": one completion per receive (" + counts + ")");
+		}
 	} else {
 		check(ringCompletions == 0, label + ": io_uring not used for this connection's data");
 	}
@@ -428,6 +484,15 @@ Future<Void> runAll(std::string mode, bool kernelCipher, Creds trusted, int* rc)
 			std::printf("NOTE kernel tls module not loaded: knob-on run checks the user-space fallback only\n");
 		}
 		co_await runOne(true, true, expectKernel, ring && expectKernel, mode, trusted, stranger);
+		if (iouring::Ring* r = iouring::Ring::existing()) {
+			std::printf("NOTE io_uring: %s receive buffers, %lld times out of buffers\n",
+			            r->hasBufferRing() ? std::to_string(FLOW_KNOBS->NET_IO_URING_RECV_BUFFERS).c_str()
+			                               : "no shared",
+			            (long long)r->stats().recvNoBuffers);
+			if (r->hasBufferRing() && FLOW_KNOBS->NET_IO_URING_RECV_BUFFERS <= 4) {
+				check(r->stats().recvNoBuffers > 0, mode + ": receives ran out of buffers and resumed");
+			}
+		}
 	} catch (Error& e) {
 		std::printf("FAIL %s: unexpected error %s\n", mode.c_str(), e.what());
 		++failures;
@@ -458,6 +523,12 @@ int main(int argc, char** argv) {
 		if (arg == "--net-io-uring") {
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING = true;
 			mode += " io_uring";
+		} else if (arg == "--no-multishot") {
+			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING_MULTISHOT = false;
+			mode += " no-multishot";
+		} else if (arg.rfind("--recv-buffers=", 0) == 0) {
+			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING_RECV_BUFFERS = std::atoi(arg.c_str() + 15);
+			mode += " " + arg.substr(2);
 		} else if (arg == "--main-thread-handshakes") {
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_SERVER_HANDSHAKE_THREADS = 0;
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_CLIENT_HANDSHAKE_THREADS = 0;
@@ -468,8 +539,10 @@ int main(int argc, char** argv) {
 			mode = (which == "cbc" ? "tls12 aes-cbc" : "tls12") + mode.substr(5);
 			kernelCipher = which != "cbc";
 		} else {
-			std::fprintf(
-			    stderr, "usage: %s [--net-io-uring] [--main-thread-handshakes] [--openssl-conf=tls12|cbc]\n", argv[0]);
+			std::fprintf(stderr,
+			             "usage: %s [--net-io-uring [--no-multishot] [--recv-buffers=N]] [--main-thread-handshakes] "
+			             "[--openssl-conf=tls12|cbc]\n",
+			             argv[0]);
 			return 2;
 		}
 	}

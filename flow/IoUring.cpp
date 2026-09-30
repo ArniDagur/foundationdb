@@ -33,6 +33,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -61,6 +62,12 @@
 #ifndef IORING_REGISTER_RING_FDS
 #define IORING_REGISTER_RING_FDS 20
 #endif
+#ifndef IORING_SETUP_NO_SQARRAY
+#define IORING_SETUP_NO_SQARRAY (1U << 16)
+#endif
+constexpr unsigned kRegisterPbufRing = 22; // IORING_REGISTER_PBUF_RING (5.19)
+constexpr uint16_t kRecvMultishot = 1U << 1; // IORING_RECV_MULTISHOT (6.0)
+constexpr uint16_t kBufferGroup = 0;
 
 namespace iouring {
 
@@ -98,14 +105,25 @@ Ring* Ring::get() {
 	return ring;
 }
 
+// struct io_uring_buf. The ring's tail overlays the last field of the first entry.
+struct Ring::BufRingEntry {
+	uint64_t addr;
+	uint32_t len;
+	uint16_t bid;
+	uint16_t resv;
+};
+
 bool Ring::init(unsigned entries) {
 	// Most capable setup first: completions posted only while this (the only submitting) thread is in
-	// io_uring_enter (no inter-processor interrupts or task work while it runs Flow tasks) and the whole batch
-	// submitted even if one entry fails; then cooperative task running (5.19); then the 5.15 baseline.
+	// io_uring_enter (no inter-processor interrupts or task work while it runs Flow tasks), the whole batch
+	// submitted even if one entry fails, and no SQ index array (6.6); the same with the index array (6.1); then
+	// cooperative task running (5.19); then the 5.15 baseline.
 	const unsigned base = IORING_SETUP_CQSIZE;
+	const unsigned modern = base | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+	                        IORING_SETUP_TASKRUN_FLAG;
 	const unsigned attempts[] = {
-		base | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
-		    IORING_SETUP_TASKRUN_FLAG,
+		modern | IORING_SETUP_NO_SQARRAY,
+		modern,
 		base | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG,
 		base,
 	};
@@ -136,7 +154,9 @@ bool Ring::init(unsigned entries) {
 		::close(ringFd);
 		return false;
 	}
-	const size_t sqBytes = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+	const bool noSqArray = (p.flags & IORING_SETUP_NO_SQARRAY) != 0;
+	const size_t sqBytes = noSqArray ? p.sq_off.flags + sizeof(unsigned) // the ring header ends before the array
+	                                 : p.sq_off.array + p.sq_entries * sizeof(unsigned);
 	const size_t cqBytes = p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe);
 	void* sq;
 	void* cq;
@@ -169,13 +189,13 @@ bool Ring::init(unsigned entries) {
 	sqTail = reinterpret_cast<unsigned*>(sqBase + p.sq_off.tail);
 	sqMask = reinterpret_cast<unsigned*>(sqBase + p.sq_off.ring_mask);
 	sqFlags = reinterpret_cast<unsigned*>(sqBase + p.sq_off.flags);
-	sqArray = reinterpret_cast<unsigned*>(sqBase + p.sq_off.array);
+	sqArray = noSqArray ? nullptr : reinterpret_cast<unsigned*>(sqBase + p.sq_off.array);
 	sqes = static_cast<io_uring_sqe*>(sqeMem);
 	cqHead = reinterpret_cast<unsigned*>(cqBase + p.cq_off.head);
 	cqTail = reinterpret_cast<unsigned*>(cqBase + p.cq_off.tail);
 	cqMask = reinterpret_cast<unsigned*>(cqBase + p.cq_off.ring_mask);
 	cqes = reinterpret_cast<io_uring_cqe*>(cqBase + p.cq_off.cqes);
-	for (unsigned i = 0; i < p.sq_entries; i++) {
+	for (unsigned i = 0; sqArray && i < p.sq_entries; i++) {
 		sqArray[i] = i;
 	}
 	sqEntries = p.sq_entries;
@@ -203,14 +223,85 @@ bool Ring::init(unsigned entries) {
 	} else {
 		enterFd = fd;
 	}
+	// Multishot receives and buffer rings predate DEFER_TASKRUN (6.0, 5.19), so its acceptance implies both.
+	if (deferTaskrun && FLOW_KNOBS->NET_IO_URING_MULTISHOT) {
+		initBufferRing();
+	}
 	TraceEvent("IoUringReady")
 	    .detail("SQEntries", p.sq_entries)
 	    .detail("CQEntries", p.cq_entries)
 	    .detail("Features", p.features)
 	    .detail("SetupFlags", setupFlags)
 	    .detail("DeferTaskrun", deferTaskrun)
-	    .detail("RegisteredRing", enterFlags != 0);
+	    .detail("RegisteredRing", enterFlags != 0)
+	    .detail("RecvBuffers", bufCount)
+	    .detail("RecvBufferBytes", bufSize);
 	return true;
+}
+
+void Ring::initBufferRing() {
+	unsigned count = 1;
+	while (count < unsigned(std::max(FLOW_KNOBS->NET_IO_URING_RECV_BUFFERS, 1)) && count < 32768) {
+		count <<= 1;
+	}
+	const size_t size = FLOW_KNOBS->NET_IO_URING_RECV_BYTES;
+	void* ringMem =
+	    mmap(nullptr, count * sizeof(BufRingEntry), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	void* mem = mmap(nullptr, count * size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	struct {
+		uint64_t ring_addr;
+		uint32_t ring_entries;
+		uint16_t bgid;
+		uint16_t flags;
+		uint64_t resv[3];
+	} reg;
+	memset(&reg, 0, sizeof(reg));
+	reg.ring_addr = reinterpret_cast<uintptr_t>(ringMem);
+	reg.ring_entries = count;
+	reg.bgid = kBufferGroup;
+	if (ringMem == MAP_FAILED || mem == MAP_FAILED ||
+	    syscall(__NR_io_uring_register, fd, kRegisterPbufRing, &reg, 1) != 0) {
+		TraceEvent(SevWarnAlways, "IoUringBufferRingFailed").GetLastError().detail("Buffers", count);
+		if (ringMem != MAP_FAILED) {
+			munmap(ringMem, count * sizeof(BufRingEntry));
+		}
+		if (mem != MAP_FAILED) {
+			munmap(mem, count * size);
+		}
+		return;
+	}
+	bufRing = static_cast<BufRingEntry*>(ringMem);
+	bufRingTail = &bufRing[0].resv;
+	bufCount = count;
+	bufSize = size;
+	bufMem = static_cast<uint8_t*>(mem);
+	for (unsigned i = 0; i < count; i++) {
+		recycleBuffer(uint16_t(i));
+	}
+}
+
+void Ring::recycleBuffer(uint16_t bid) {
+	BufRingEntry& e = bufRing[bufTail & (bufCount - 1)];
+	e.addr = reinterpret_cast<uintptr_t>(bufferData(bid));
+	e.len = bufSize;
+	e.bid = bid;
+	++bufTail;
+	__atomic_store_n(bufRingTail, bufTail, __ATOMIC_RELEASE);
+	if (!bufferWaiters.empty()) {
+		std::vector<BufferWaiter*> waiters;
+		waiters.swap(bufferWaiters);
+		for (BufferWaiter* w : waiters) {
+			w->buffersAvailable();
+		}
+	}
+}
+
+void Ring::waitForBuffers(BufferWaiter* waiter) {
+	bufferWaiters.push_back(waiter);
+}
+
+void Ring::cancelBufferWait(BufferWaiter* waiter) {
+	bufferWaiters.erase(std::remove(bufferWaiters.begin(), bufferWaiters.end(), waiter), bufferWaiters.end());
 }
 
 int Ring::enter(unsigned toSubmit, unsigned minComplete, unsigned flags, const void* arg, unsigned argSize) {
@@ -326,7 +417,7 @@ int Ring::reap() {
 			__atomic_store_n(cqHead, head, __ATOMIC_RELEASE);
 			const int kind = int(cqe.user_data & kKindMask);
 			++counters.completed[kind];
-			reinterpret_cast<Op*>(cqe.user_data & ~kKindMask)->complete(cqe.res);
+			reinterpret_cast<Op*>(cqe.user_data & ~kKindMask)->complete(cqe.res, cqe.flags);
 			++total;
 		}
 	}
@@ -334,7 +425,7 @@ int Ring::reap() {
 	return total;
 }
 
-void Ring::InternalOp::complete(int32_t) {
+void Ring::InternalOp::complete(int32_t, uint32_t) {
 	armed = false;
 	fired = true;
 }
@@ -374,6 +465,7 @@ void Ring::maybeLogMetrics(double now, double intervalSeconds) {
 		ev.detail(std::string("Submitted") + kindName(k), counters.submitted[k] - lastLogged.submitted[k]);
 		ev.detail(std::string("Completed") + kindName(k), counters.completed[k] - lastLogged.completed[k]);
 	}
+	ev.detail("RecvNoBuffers", counters.recvNoBuffers - lastLogged.recvNoBuffers);
 	ev.detail("Queued", unsubmitted);
 	lastLogged = counters;
 }
@@ -383,6 +475,22 @@ void prepRecv(io_uring_sqe* s, int fd, void* buf, unsigned len, int flags) {
 	s->fd = fd;
 	s->addr = reinterpret_cast<uintptr_t>(buf);
 	s->len = len;
+	s->msg_flags = flags;
+}
+
+void prepRecvMultishot(io_uring_sqe* s, int fd) {
+	s->opcode = IORING_OP_RECV;
+	s->fd = fd;
+	s->flags = IOSQE_BUFFER_SELECT;
+	s->buf_group = kBufferGroup;
+	s->ioprio = kRecvMultishot;
+}
+
+void prepSendmsg(io_uring_sqe* s, int fd, const msghdr* msg, int flags) {
+	s->opcode = IORING_OP_SENDMSG;
+	s->fd = fd;
+	s->addr = reinterpret_cast<uintptr_t>(msg);
+	s->len = 1;
 	s->msg_flags = flags;
 }
 

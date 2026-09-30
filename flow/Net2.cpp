@@ -19,6 +19,7 @@
  */
 
 #include <algorithm>
+#include <deque>
 #include <memory>
 #include <string_view>
 
@@ -68,6 +69,7 @@
 #include "flow/IoUring.h"
 #ifdef __linux__
 #include <fcntl.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #endif
 
@@ -437,34 +439,70 @@ public:
 };
 
 #ifdef __linux__
-// Socket I/O of one connection through the network thread's io_uring (FLOW_KNOBS->NET_IO_URING): at most one receive,
-// into this object's buffer, and one send, from this object's copy of the data, are in flight. The descriptor must be
-// in blocking mode, so that io_uring waits for readiness itself instead of completing with EAGAIN. In-flight
-// operations keep the object alive; shutdownForClose() makes them complete.
-class UringSocket final : public ReferenceCounted<UringSocket> {
+// Socket I/O of one connection through the network thread's io_uring (FLOW_KNOBS->NET_IO_URING).
+//
+// Receives: with a provided buffer ring, one multishot receive stays armed for the life of the connection and each
+// chunk of data arrives in a shared buffer that read() copies out and returns to the ring. Otherwise one receive at a
+// time goes into this object's own buffer.
+//
+// Sends: one sendmsg at a time, straight from the caller's PacketBuffers (write() takes a reference on each, so the
+// caller may treat the bytes as sent). A short send is resubmitted from where it stopped.
+//
+// The descriptor must be in blocking mode, so that io_uring waits for readiness itself instead of completing with
+// EAGAIN, and out of Asio's epoll set. In-flight operations keep the object alive; shutdownForClose() makes them
+// complete.
+class UringSocket final : public ReferenceCounted<UringSocket>, iouring::BufferWaiter {
 public:
 	// Returned by read() on a kernel TLS socket when the next record is not application data (a TLS alert or
 	// post-handshake message): the caller must let OpenSSL read it, then call resumeReceive().
 	static constexpr int kControlRecord = -2;
 
 	UringSocket(iouring::Ring* ring, int fd, bool kernelTls)
-	  : ring(ring), fd(fd), kernelTls(kernelTls), rxBuf(FLOW_KNOBS->NET_IO_URING_RECV_BYTES) {
+	  : ring(ring), fd(fd), kernelTls(kernelTls), multishot(ring->hasBufferRing()) {
+		if (!multishot) {
+			rxBuf.resize(FLOW_KNOBS->NET_IO_URING_RECV_BYTES);
+		}
 		recvOp.owner = this;
 		sendOp.owner = this;
+	}
+
+	~UringSocket() {
+		for (const RxChunk& c : rxChunks) {
+			ring->recycleBuffer(c.bid);
+		}
+		if (waitingForBuffers) {
+			ring->cancelBufferWait(this);
+		}
 	}
 
 	// Copies received bytes into [begin, end) and returns how many; 0 when none have arrived yet (a receive is then in
 	// flight). After EOF or an error returns -1 with errnum set (0 for EOF).
 	int read(uint8_t* begin, uint8_t* end, int& errnum) {
-		if (rxEnd > rxBegin) {
-			const size_t n = std::min<size_t>(rxEnd - rxBegin, end - begin);
-			memcpy(begin, rxBuf.data() + rxBegin, n);
-			rxBegin += n;
+		size_t copied = 0;
+		const size_t room = end - begin;
+		if (multishot) {
+			while (!rxChunks.empty() && copied < room) {
+				RxChunk& c = rxChunks.front();
+				const size_t n = std::min<size_t>(c.len - c.off, room - copied);
+				memcpy(begin + copied, ring->bufferData(c.bid) + c.off, n);
+				c.off += n;
+				copied += n;
+				if (c.off == c.len) {
+					ring->recycleBuffer(c.bid);
+					rxChunks.pop_front();
+				}
+			}
+		} else if (rxEnd > rxBegin) {
+			copied = std::min<size_t>(rxEnd - rxBegin, room);
+			memcpy(begin, rxBuf.data() + rxBegin, copied);
+			rxBegin += copied;
 			if (rxBegin == rxEnd) {
 				rxBegin = rxEnd = 0;
 				armReceive();
 			}
-			return n;
+		}
+		if (copied > 0) {
+			return copied;
 		}
 		if (rxControl) {
 			return kControlRecord;
@@ -483,15 +521,15 @@ public:
 	}
 
 	Future<Void> onReadable() {
-		if (rxEnd > rxBegin || rxDone || rxControl) {
+		if (hasReceived() || rxDone || rxControl) {
 			return Void();
 		}
 		armReceive();
 		return rxReady.getFuture();
 	}
 
-	// Copies up to limit unsent bytes of the chain and submits them; returns how many, or 0 while a send is in flight.
-	// After a send error returns -1 with errnum set.
+	// Submits up to limit unsent bytes of the chain, which must consist of PacketBuffers, and returns how many; 0 while
+	// a send is in flight. After a send error returns -1 with errnum set.
 	int write(SendBuffer const* data, int limit, int& errnum) {
 		if (txErrno) {
 			errnum = txErrno;
@@ -500,18 +538,28 @@ public:
 		if (txPending) {
 			return 0;
 		}
-		if (txBuf.size() < size_t(limit)) {
-			txBuf.resize(limit);
+		if (closed) {
+			errnum = EPIPE;
+			return -1;
 		}
 		size_t len = 0;
-		for (auto p = data; p && len < size_t(limit); p = p->next) {
-			const size_t n = std::min<size_t>(p->bytes_written - p->bytes_sent, limit - len);
-			memcpy(txBuf.data() + len, p->data() + p->bytes_sent, n);
+		txIovCount = 0;
+		for (auto p = data; p && len < size_t(limit) && txIovCount < kMaxIov; p = p->next) {
+			const int unsent = p->bytes_written - p->bytes_sent;
+			if (unsent <= 0) {
+				continue;
+			}
+			const size_t n = std::min<size_t>(unsent, limit - len);
+			txIov[txIovCount].iov_base = const_cast<uint8_t*>(p->data() + p->bytes_sent);
+			txIov[txIovCount].iov_len = n;
+			PacketBuffer* pb = static_cast<PacketBuffer*>(const_cast<SendBuffer*>(p));
+			pb->addref();
+			txRefs[txIovCount] = pb;
+			++txIovCount;
 			len += n;
 		}
 		ASSERT(len > 0);
-		txOff = 0;
-		txLen = len;
+		txFirst = 0;
 		submitSend();
 		return len;
 	}
@@ -523,7 +571,8 @@ public:
 		return txReady.getFuture();
 	}
 
-	// Must run before the descriptor is closed: queued entries name it by number.
+	// Must run before the descriptor is closed: queued entries name it by number, and in-flight ones hold the socket
+	// open until they complete.
 	void shutdownForClose() {
 		if (closed) {
 			return;
@@ -534,34 +583,77 @@ public:
 	}
 
 private:
+	static constexpr int kMaxIov = 64;
+
 	struct RecvOp final : iouring::Op {
 		UringSocket* owner = nullptr;
 		Reference<UringSocket> keepAlive;
-		void complete(int32_t res) override { owner->receiveDone(res); }
+		void complete(int32_t res, uint32_t flags) override { owner->receiveDone(res, flags); }
 	};
 	struct SendOp final : iouring::Op {
 		UringSocket* owner = nullptr;
 		Reference<UringSocket> keepAlive;
-		void complete(int32_t res) override { owner->sendDone(res); }
+		void complete(int32_t res, uint32_t) override { owner->sendDone(res); }
+	};
+	struct RxChunk {
+		uint16_t bid;
+		uint32_t len;
+		uint32_t off;
 	};
 
+	bool hasReceived() const { return multishot ? !rxChunks.empty() : rxEnd > rxBegin; }
+
 	void armReceive() {
-		if (rxPending || rxDone || rxControl || closed) {
+		if (rxPending || rxDone || rxControl || closed || waitingForBuffers || (!multishot && rxEnd > rxBegin)) {
 			return;
 		}
 		rxPending = true;
 		recvOp.keepAlive = Reference<UringSocket>::addRef(this);
 		io_uring_sqe* s = ring->sqe();
-		iouring::prepRecv(s, fd, rxBuf.data(), rxBuf.size(), 0);
+		if (multishot) {
+			iouring::prepRecvMultishot(s, fd);
+		} else {
+			iouring::prepRecv(s, fd, rxBuf.data(), rxBuf.size(), 0);
+		}
 		ring->queue(s, &recvOp, iouring::Kind::NetRecv);
 	}
 
-	void receiveDone(int32_t res) {
-		Reference<UringSocket> self = std::move(recvOp.keepAlive);
-		rxPending = false;
+	void buffersAvailable() override {
+		waitingForBuffers = false;
+		armReceive();
+	}
+
+	void receiveDone(int32_t res, uint32_t flags) {
+		const bool more = (flags & iouring::kCqeMore) != 0;
+		Reference<UringSocket> self; // the last reference may go when this returns
+		if (!more) {
+			self = std::move(recvOp.keepAlive);
+			rxPending = false;
+		}
 		if (res > 0) {
-			rxBegin = 0;
-			rxEnd = res;
+			if (multishot) {
+				ASSERT(flags & iouring::kCqeBuffer);
+				const uint16_t bid = iouring::cqeBufferId(flags);
+				if (closed) {
+					ring->recycleBuffer(bid);
+				} else {
+					rxChunks.push_back(RxChunk{ bid, uint32_t(res), 0 });
+				}
+				if (!more) {
+					armReceive(); // the kernel ended the multishot receive (a full completion queue, say)
+				}
+			} else {
+				rxBegin = 0;
+				rxEnd = res;
+			}
+		} else if (res == -ENOBUFS && multishot) {
+			// Every provided buffer holds data not yet read; re-arm once one comes back.
+			ring->noteRecvNoBuffers();
+			if (!closed) {
+				waitingForBuffers = true;
+				ring->waitForBuffers(this);
+			}
+			return;
 		} else if (res == -EIO && kernelTls && !closed) {
 			rxControl = true;
 		} else {
@@ -576,8 +668,12 @@ private:
 	void submitSend() {
 		txPending = true;
 		sendOp.keepAlive = Reference<UringSocket>::addRef(this);
+		memset(&txMsg, 0, sizeof(txMsg));
+		txMsg.msg_iov = txIov + txFirst;
+		txMsg.msg_iovlen = txIovCount - txFirst;
 		io_uring_sqe* s = ring->sqe();
-		iouring::prepSend(s, fd, txBuf.data() + txOff, txLen - txOff, MSG_NOSIGNAL);
+		// MSG_WAITALL has the kernel (5.18+) finish a short send itself; kernel TLS rejects the flag.
+		iouring::prepSendmsg(s, fd, &txMsg, MSG_NOSIGNAL | (kernelTls ? 0 : MSG_WAITALL));
 		ring->queue(s, &sendOp, iouring::Kind::NetSend);
 	}
 
@@ -586,12 +682,22 @@ private:
 		if (res < 0) {
 			txErrno = -res;
 		} else {
-			txOff += res;
-			if (txOff < txLen && !closed) {
+			size_t sent = res;
+			while (txFirst < txIovCount && sent >= txIov[txFirst].iov_len) {
+				sent -= txIov[txFirst].iov_len;
+				++txFirst;
+			}
+			if (txFirst < txIovCount && !closed) {
+				txIov[txFirst].iov_base = static_cast<uint8_t*>(txIov[txFirst].iov_base) + sent;
+				txIov[txFirst].iov_len -= sent;
 				submitSend(); // a short send; the rest follows
 				return;
 			}
 		}
+		for (int i = 0; i < txIovCount; i++) {
+			txRefs[i]->delref();
+		}
+		txIovCount = txFirst = 0;
 		txPending = false;
 		Promise<Void> ready = std::move(txReady);
 		txReady = Promise<Void>();
@@ -601,25 +707,29 @@ private:
 	iouring::Ring* ring;
 	int fd;
 	bool kernelTls;
+	bool multishot;
 	bool closed = false;
 
-	std::vector<uint8_t> rxBuf;
+	std::deque<RxChunk> rxChunks; // multishot: received data in provided buffers, oldest first
+	std::vector<uint8_t> rxBuf; // otherwise
 	size_t rxBegin = 0, rxEnd = 0;
-	bool rxPending = false, rxDone = false, rxControl = false;
+	bool rxPending = false, rxDone = false, rxControl = false, waitingForBuffers = false;
 	int rxErrno = 0;
 	Promise<Void> rxReady;
 	RecvOp recvOp;
 
-	std::vector<uint8_t> txBuf;
-	size_t txOff = 0, txLen = 0;
+	msghdr txMsg;
+	iovec txIov[kMaxIov];
+	PacketBuffer* txRefs[kMaxIov];
+	int txIovCount = 0, txFirst = 0;
 	bool txPending = false;
 	int txErrno = 0;
 	Promise<Void> txReady;
 	SendOp sendOp;
 };
 
-// A UringSocket for fd when FLOW_KNOBS->NET_IO_URING is set and the ring is available; switches the descriptor to
-// blocking mode.
+// A UringSocket for fd when FLOW_KNOBS->NET_IO_URING is set and the ring is available; takes the descriptor out of
+// Asio's epoll set (where every arriving packet would otherwise wake the run loop) and switches it to blocking mode.
 static Reference<UringSocket> makeUringSocket(int fd, bool kernelTls) {
 	if (!FLOW_KNOBS->NET_IO_URING) {
 		return {};
@@ -632,6 +742,7 @@ static Reference<UringSocket> makeUringSocket(int fd, bool kernelTls) {
 	if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
 		return {};
 	}
+	g_net2->reactor.unwatchDescriptor(fd);
 	static SimpleCounter<int64_t>* countUringConnections =
 	    SimpleCounter<int64_t>::makeCounter("/Net2/IoUring/Connections");
 	countUringConnections->increment(1);
@@ -648,6 +759,14 @@ public:
 
 	explicit Connection(boost::asio::io_context& io_service)
 	  : id(nondeterministicRandom()->randomUniqueID()), socket(io_service) {}
+
+#ifdef __linux__
+	~Connection() {
+		if (uring) {
+			uring->shutdownForClose();
+		}
+	}
+#endif
 
 	// This is not part of the IConnection interface, because it is wrapped by INetwork::connect()
 	static Future<Reference<IConnection>> connect(boost::asio::io_context* ios, NetworkAddress addr) {
@@ -1215,6 +1334,14 @@ public:
 	explicit SSLConnection(Reference<ReferencedObject<boost::asio::ssl::context>> context, tcp::socket* existingSocket)
 	  : id(nondeterministicRandom()->randomUniqueID()), socket(std::move(*existingSocket)),
 	    ssl_sock(socket, context->mutate()), sslContext(context) {}
+
+#ifdef __linux__
+	~SSLConnection() {
+		if (uring) {
+			uring->shutdownForClose();
+		}
+	}
+#endif
 
 	// This is not part of the IConnection interface, because it is wrapped by INetwork::connect()
 	static Future<Reference<IConnection>> connect(boost::asio::io_context* ios,
@@ -2763,7 +2890,7 @@ ASIOReactor::ASIOReactor(Net2* net) : do_not_stop(ios.get_executor()), network(n
 
 #ifdef __linux__
 namespace {
-// Asio keeps its epoll descriptor private; an explicit template instantiation may name private members.
+// Asio keeps the state below private; an explicit template instantiation may name private members.
 template <typename Tag, typename Tag::type Member>
 struct PrivateMember {
 	friend typename Tag::type privateMemberOf(Tag) { return Member; }
@@ -2773,10 +2900,50 @@ struct EpollFdTag {
 	friend type privateMemberOf(EpollFdTag);
 };
 template struct PrivateMember<EpollFdTag, &boost::asio::detail::epoll_reactor::epoll_fd_>;
+struct SchedulerMutexTag {
+	using type = boost::asio::detail::conditionally_enabled_mutex boost::asio::detail::scheduler::*;
+	friend type privateMemberOf(SchedulerMutexTag);
+};
+template struct PrivateMember<SchedulerMutexTag, &boost::asio::detail::scheduler::mutex_>;
+struct SchedulerQueueTag {
+	using type =
+	    boost::asio::detail::op_queue<boost::asio::detail::scheduler_operation> boost::asio::detail::scheduler::*;
+	friend type privateMemberOf(SchedulerQueueTag);
+};
+template struct PrivateMember<SchedulerQueueTag, &boost::asio::detail::scheduler::op_queue_>;
+struct SchedulerInterruptedTag {
+	using type = bool boost::asio::detail::scheduler::*;
+	friend type privateMemberOf(SchedulerInterruptedTag);
+};
+template struct PrivateMember<SchedulerInterruptedTag, &boost::asio::detail::scheduler::task_interrupted_>;
 } // namespace
 
 int ASIOReactor::asioEpollFd() {
 	return boost::asio::use_service<boost::asio::detail::epoll_reactor>(ios).*privateMemberOf(EpollFdTag{});
+}
+
+void ASIOReactor::unwatchDescriptor(int fd) {
+	epoll_event ev{};
+	epoll_ctl(asioEpollFd(), EPOLL_CTL_DEL, fd, &ev);
+}
+
+// Outside poll_one() the scheduler's queue always holds its reactor task; anything more is a handler to run.
+bool ASIOReactor::asioHasHandlers() {
+	auto& scheduler = boost::asio::use_service<boost::asio::detail::scheduler>(ios);
+	boost::asio::detail::conditionally_enabled_mutex::scoped_lock lock(scheduler.*privateMemberOf(SchedulerMutexTag{}));
+	auto* front = (scheduler.*privateMemberOf(SchedulerQueueTag{})).front();
+	return front && boost::asio::detail::op_queue_access::next(front);
+}
+
+void ASIOReactor::pollAsio() {
+	while (ios.poll_one())
+		++network->countASIOEvents;
+	// poll_one() leaves the scheduler marked as interrupted, which suppresses the epoll interrupt that a later post
+	// (from a resolver thread, or an operation that completed immediately) would make. Clearing it lets those posts
+	// make Asio's epoll descriptor, and so the ring, ready.
+	auto& scheduler = boost::asio::use_service<boost::asio::detail::scheduler>(ios);
+	boost::asio::detail::conditionally_enabled_mutex::scoped_lock lock(scheduler.*privateMemberOf(SchedulerMutexTag{}));
+	scheduler.*privateMemberOf(SchedulerInterruptedTag{}) = false;
 }
 #endif
 
@@ -2787,12 +2954,10 @@ void ASIOReactor::sleep(double sleepTime) {
 			if (!ringLoop) {
 				ring->watchEpoll(asioEpollFd());
 				ringLoop = true;
+				pollAsio();
 			}
-			// Handlers Asio already has queued (an operation that completed immediately, say) run without waiting.
-			if (ios.poll_one()) {
-				asioBusy = true;
-				++network->countASIOEvents;
-				return;
+			if (asioHasHandlers()) {
+				return; // react() runs them
 			}
 			if (sleepTime > FLOW_KNOBS->BUSY_WAIT_THRESHOLD) {
 				setProfilingEnabled(0);
@@ -2851,14 +3016,9 @@ void ASIOReactor::react() {
 		ring->reap();
 		ring->maybeLogMetrics(timer_monotonic(), FLOW_KNOBS->IO_URING_METRICS_INTERVAL);
 		if (ringLoop) {
-			// Asio only has work when its epoll descriptor fired, another thread woke the loop, or sleep() ran one of
-			// its handlers.
-			const bool epollReady = ring->takeEpollReady();
-			const bool woken = ring->takeWoken();
-			if (asioBusy || epollReady || woken) {
-				asioBusy = false;
-				while (ios.poll_one())
-					++network->countASIOEvents;
+			ring->takeWoken(); // wake() only ends the wait; the run loop picks up the other thread's work itself
+			if (ring->takeEpollReady() || asioHasHandlers()) {
+				pollAsio();
 			}
 			return;
 		}

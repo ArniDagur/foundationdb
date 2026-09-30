@@ -43,6 +43,11 @@ public:
 
 	void wake();
 
+#ifdef __linux__
+	// Removes a socket that io_uring now serves from Asio's epoll set. Asio must not start operations on it again.
+	void unwatchDescriptor(int fd);
+#endif
+
 	boost::asio::io_context ios;
 	boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
 	    do_not_stop; // Reactor needs to keep running when there is nothing to do until stopped explicitly
@@ -51,13 +56,15 @@ private:
 	Net2* network;
 	boost::asio::deadline_timer firstTimer;
 #ifdef __linux__
-	// FLOW_KNOBS->NET_IO_URING: the run loop waits on the io_uring, which watches Asio's epoll descriptor.
+	// FLOW_KNOBS->NET_IO_URING: the run loop waits on the io_uring, which watches Asio's epoll descriptor, and Asio is
+	// polled only when that descriptor fired or it has handlers queued.
 	bool ringLoop = false;
-	bool asioBusy = false; // Asio ran a handler in sleep(), so it may have more ready
 	// Otherwise, while an io_uring exists (FLOW_KNOBS->KAIO_IO_URING), Asio watches the ring's descriptor.
 	std::unique_ptr<boost::asio::posix::stream_descriptor> ringWatch;
 	bool ringWatchArmed = false;
 	int asioEpollFd();
+	bool asioHasHandlers();
+	void pollAsio();
 #endif
 
 	static void nullWaitHandler(const boost::system::error_code&) {}

@@ -159,7 +159,9 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( NET_IO_URING,                                      false );
 	init( KAIO_IO_URING,                                     false );
 	init( IO_URING_ENTRIES,                                   4096 );
-	init( NET_IO_URING_RECV_BYTES,                           65536 );
+	init( NET_IO_URING_RECV_BYTES,                           32768 );
+	init( NET_IO_URING_RECV_BUFFERS,                          1024 );
+	init( NET_IO_URING_MULTISHOT,                             true );
 	init( IO_URING_METRICS_INTERVAL,                           5.0 );
 	init( NETWORK_TEST_CLIENT_COUNT,                            30 );
 	init( NETWORK_TEST_REPLY_SIZE,                           600e3 );
