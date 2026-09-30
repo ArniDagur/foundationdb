@@ -148,7 +148,8 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/SplitLargeIO") {
 		wbuf[i] = static_cast<uint8_t>(deterministicRandom()->randomInt(0, 256));
 	}
 	const std::string filename =
-	    format("/tmp/__KAIO_SPLIT_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str());
+	    joinPath(params.getDataDir(),
+	             format("__KAIO_SPLIT_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str()));
 	Reference<IAsyncFile> f;
 	Optional<Error> err;
 	try {
@@ -236,7 +237,8 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/Fdsync") {
 	uint8_t* wbuf = static_cast<uint8_t*>(allocateFast4kAligned(length));
 	uint8_t* rbuf = static_cast<uint8_t*>(allocateFast4kAligned(length));
 	const std::string filename =
-	    format("/tmp/__KAIO_FDSYNC_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str());
+	    joinPath(params.getDataDir(),
+	             format("__KAIO_FDSYNC_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str()));
 	Reference<IAsyncFile> f;
 	Optional<Error> err;
 	try {
@@ -327,7 +329,8 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/SplitRandomIO") {
 		bufs.push_back(static_cast<uint8_t*>(allocateFast4kAligned(maxOpBytes)));
 	}
 	const std::string filename =
-	    format("/tmp/__KAIO_SPLIT_RANDOM_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str());
+	    joinPath(params.getDataDir(),
+	             format("__KAIO_SPLIT_RANDOM_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str()));
 	Reference<IAsyncFile> f;
 	Optional<Error> err;
 	int64_t splitOps = 0;
@@ -420,7 +423,8 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
 		bufs.push_back(static_cast<uint8_t*>(allocateFast4kAligned(blockBytes)));
 	}
 	const std::string filename =
-	    format("/tmp/__KAIO_IOURING_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str());
+	    joinPath(params.getDataDir(),
+	             format("__KAIO_IOURING_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str()));
 	Reference<IAsyncFile> f;
 	Optional<Error> err;
 	try {
