@@ -231,6 +231,10 @@ Future<std::string> receiveAll(Reference<IConnection> conn, int size) {
 Future<Void> backpressureCheck(Reference<IConnection> sender, Reference<IConnection> receiver, std::string label) {
 	const int size = 32 << 20;
 	const std::string data = pattern(size, 99);
+	// Small socket buffers, so the payload cannot fit in them (loopback autotuning would otherwise absorb it).
+	const int small = 64 << 10;
+	setsockopt(sender->getSocket().native_handle(), SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+	setsockopt(receiver->getSocket().native_handle(), SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
 	int blocked = 0;
 	Future<Void> sent = sendAll(sender, data, &blocked);
 	co_await delay(0.3);
