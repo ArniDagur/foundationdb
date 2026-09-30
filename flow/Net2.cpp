@@ -65,6 +65,11 @@
 #include "flow/ScopeExit.h"
 #include "flow/IUDPSocket.h"
 #include "flow/IConnection.h"
+#include "flow/IoUring.h"
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/socket.h>
+#endif
 
 #ifdef ADDRESS_SANITIZER
 #include <sanitizer/lsan_interface.h>
@@ -431,6 +436,209 @@ public:
 	}
 };
 
+#ifdef __linux__
+// Socket I/O of one connection through the network thread's io_uring (FLOW_KNOBS->NET_IO_URING): at most one receive,
+// into this object's buffer, and one send, from this object's copy of the data, are in flight. The descriptor must be
+// in blocking mode, so that io_uring waits for readiness itself instead of completing with EAGAIN. In-flight
+// operations keep the object alive; shutdownForClose() makes them complete.
+class UringSocket final : public ReferenceCounted<UringSocket> {
+public:
+	// Returned by read() on a kernel TLS socket when the next record is not application data (a TLS alert or
+	// post-handshake message): the caller must let OpenSSL read it, then call resumeReceive().
+	static constexpr int kControlRecord = -2;
+
+	UringSocket(iouring::Ring* ring, int fd, bool kernelTls)
+	  : ring(ring), fd(fd), kernelTls(kernelTls), rxBuf(FLOW_KNOBS->NET_IO_URING_RECV_BYTES) {
+		recvOp.owner = this;
+		sendOp.owner = this;
+	}
+
+	// Copies received bytes into [begin, end) and returns how many; 0 when none have arrived yet (a receive is then in
+	// flight). After EOF or an error returns -1 with errnum set (0 for EOF).
+	int read(uint8_t* begin, uint8_t* end, int& errnum) {
+		if (rxEnd > rxBegin) {
+			const size_t n = std::min<size_t>(rxEnd - rxBegin, end - begin);
+			memcpy(begin, rxBuf.data() + rxBegin, n);
+			rxBegin += n;
+			if (rxBegin == rxEnd) {
+				rxBegin = rxEnd = 0;
+				armReceive();
+			}
+			return n;
+		}
+		if (rxControl) {
+			return kControlRecord;
+		}
+		if (rxDone) {
+			errnum = rxErrno;
+			return -1;
+		}
+		armReceive();
+		return 0;
+	}
+
+	void resumeReceive() {
+		rxControl = false;
+		armReceive();
+	}
+
+	Future<Void> onReadable() {
+		if (rxEnd > rxBegin || rxDone || rxControl) {
+			return Void();
+		}
+		armReceive();
+		return rxReady.getFuture();
+	}
+
+	// Copies up to limit unsent bytes of the chain and submits them; returns how many, or 0 while a send is in flight.
+	// After a send error returns -1 with errnum set.
+	int write(SendBuffer const* data, int limit, int& errnum) {
+		if (txErrno) {
+			errnum = txErrno;
+			return -1;
+		}
+		if (txPending) {
+			return 0;
+		}
+		if (txBuf.size() < size_t(limit)) {
+			txBuf.resize(limit);
+		}
+		size_t len = 0;
+		for (auto p = data; p && len < size_t(limit); p = p->next) {
+			const size_t n = std::min<size_t>(p->bytes_written - p->bytes_sent, limit - len);
+			memcpy(txBuf.data() + len, p->data() + p->bytes_sent, n);
+			len += n;
+		}
+		ASSERT(len > 0);
+		txOff = 0;
+		txLen = len;
+		submitSend();
+		return len;
+	}
+
+	Future<Void> onWritable() {
+		if (!txPending || txErrno) {
+			return Void();
+		}
+		return txReady.getFuture();
+	}
+
+	// Must run before the descriptor is closed: queued entries name it by number.
+	void shutdownForClose() {
+		if (closed) {
+			return;
+		}
+		closed = true;
+		ring->flush();
+		::shutdown(fd, SHUT_RDWR);
+	}
+
+private:
+	struct RecvOp final : iouring::Op {
+		UringSocket* owner = nullptr;
+		Reference<UringSocket> keepAlive;
+		void complete(int32_t res) override { owner->receiveDone(res); }
+	};
+	struct SendOp final : iouring::Op {
+		UringSocket* owner = nullptr;
+		Reference<UringSocket> keepAlive;
+		void complete(int32_t res) override { owner->sendDone(res); }
+	};
+
+	void armReceive() {
+		if (rxPending || rxDone || rxControl || closed) {
+			return;
+		}
+		rxPending = true;
+		recvOp.keepAlive = Reference<UringSocket>::addRef(this);
+		io_uring_sqe* s = ring->sqe();
+		iouring::prepRecv(s, fd, rxBuf.data(), rxBuf.size(), 0);
+		ring->queue(s, &recvOp, iouring::Kind::NetRecv);
+	}
+
+	void receiveDone(int32_t res) {
+		Reference<UringSocket> self = std::move(recvOp.keepAlive);
+		rxPending = false;
+		if (res > 0) {
+			rxBegin = 0;
+			rxEnd = res;
+		} else if (res == -EIO && kernelTls && !closed) {
+			rxControl = true;
+		} else {
+			rxDone = true;
+			rxErrno = res == 0 ? 0 : -res;
+		}
+		Promise<Void> ready = std::move(rxReady);
+		rxReady = Promise<Void>();
+		ready.send(Void());
+	}
+
+	void submitSend() {
+		txPending = true;
+		sendOp.keepAlive = Reference<UringSocket>::addRef(this);
+		io_uring_sqe* s = ring->sqe();
+		iouring::prepSend(s, fd, txBuf.data() + txOff, txLen - txOff, MSG_NOSIGNAL);
+		ring->queue(s, &sendOp, iouring::Kind::NetSend);
+	}
+
+	void sendDone(int32_t res) {
+		Reference<UringSocket> self = std::move(sendOp.keepAlive);
+		if (res < 0) {
+			txErrno = -res;
+		} else {
+			txOff += res;
+			if (txOff < txLen && !closed) {
+				submitSend(); // a short send; the rest follows
+				return;
+			}
+		}
+		txPending = false;
+		Promise<Void> ready = std::move(txReady);
+		txReady = Promise<Void>();
+		ready.send(Void());
+	}
+
+	iouring::Ring* ring;
+	int fd;
+	bool kernelTls;
+	bool closed = false;
+
+	std::vector<uint8_t> rxBuf;
+	size_t rxBegin = 0, rxEnd = 0;
+	bool rxPending = false, rxDone = false, rxControl = false;
+	int rxErrno = 0;
+	Promise<Void> rxReady;
+	RecvOp recvOp;
+
+	std::vector<uint8_t> txBuf;
+	size_t txOff = 0, txLen = 0;
+	bool txPending = false;
+	int txErrno = 0;
+	Promise<Void> txReady;
+	SendOp sendOp;
+};
+
+// A UringSocket for fd when FLOW_KNOBS->NET_IO_URING is set and the ring is available; switches the descriptor to
+// blocking mode.
+static Reference<UringSocket> makeUringSocket(int fd, bool kernelTls) {
+	if (!FLOW_KNOBS->NET_IO_URING) {
+		return {};
+	}
+	iouring::Ring* ring = iouring::Ring::get();
+	if (!ring) {
+		return {};
+	}
+	const int flags = fcntl(fd, F_GETFL);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+		return {};
+	}
+	static SimpleCounter<int64_t>* countUringConnections =
+	    SimpleCounter<int64_t>::makeCounter("/Net2/IoUring/Connections");
+	countUringConnections->increment(1);
+	return makeReference<UringSocket>(ring, fd, kernelTls);
+}
+#endif
+
 class Connection final : public IConnection, ReferenceCounted<Connection> {
 public:
 	void addref() override { ReferenceCounted<Connection>::addref(); }
@@ -475,6 +683,11 @@ public:
 	// returns when write() can write at least one byte
 	Future<Void> onWritable() override {
 		++g_net2->countWriteProbes;
+#ifdef __linux__
+		if (uring) {
+			return uring->onWritable();
+		}
+#endif
 		BindPromise p("N2_WriteProbeError", id, peer_address);
 		auto f = p.getFuture();
 		socket.async_write_some(boost::asio::null_buffers(), std::move(p));
@@ -484,6 +697,11 @@ public:
 	// returns when read() can read at least one byte
 	Future<Void> onReadable() override {
 		++g_net2->countReadProbes;
+#ifdef __linux__
+		if (uring) {
+			return uring->onReadable();
+		}
+#endif
 		BindPromise p("N2_ReadProbeError", id, peer_address);
 		auto f = p.getFuture();
 		socket.async_read_some(boost::asio::null_buffers(), std::move(p));
@@ -495,6 +713,23 @@ public:
 	int read(uint8_t* begin, uint8_t* end) override {
 		boost::system::error_code err;
 		++g_net2->countReads;
+#ifdef __linux__
+		if (uring) {
+			int errnum = 0;
+			const int n = uring->read(begin, end, errnum);
+			if (n > 0) {
+				g_net2->bytesReceived += n;
+				return n;
+			}
+			if (n == 0) {
+				++g_net2->countWouldBlock;
+				return 0;
+			}
+			onReadError(errnum ? boost::system::error_code(errnum, boost::system::system_category())
+			                   : boost::system::error_code(boost::asio::error::eof));
+			throw connection_failed();
+		}
+#endif
 		size_t toRead = end - begin;
 		size_t size = socket.read_some(boost::asio::mutable_buffer(begin, toRead), err);
 		g_net2->bytesReceived += size;
@@ -517,6 +752,20 @@ public:
 	int write(SendBuffer const* data, int limit) override {
 		boost::system::error_code err;
 		++g_net2->countWrites;
+#ifdef __linux__
+		if (uring) {
+			int errnum = 0;
+			const int n = uring->write(data, limit, errnum);
+			if (n >= 0) {
+				if (n == 0) {
+					++g_net2->countWouldBlock;
+				}
+				return n;
+			}
+			onWriteError(boost::system::error_code(errnum, boost::system::system_category()));
+			throw connection_failed();
+		}
+#endif
 
 		size_t sent = socket.write_some(
 		    boost::iterator_range<SendBufferIterator>(SendBufferIterator(data, limit), SendBufferIterator()), err);
@@ -559,6 +808,9 @@ private:
 	UID id;
 	tcp::socket socket;
 	NetworkAddress peer_address;
+#ifdef __linux__
+	Reference<UringSocket> uring;
+#endif
 
 	void init() {
 		// Socket settings that have to be set after connect or accept succeeds
@@ -574,9 +826,17 @@ private:
 #endif
 		}
 		platform::setCloseOnExec(socket.native_handle());
+#ifdef __linux__
+		uring = makeUringSocket(socket.native_handle(), /*kernelTls=*/false);
+#endif
 	}
 
 	void closeSocket() {
+#ifdef __linux__
+		if (uring) {
+			uring->shutdownForClose();
+		}
+#endif
 		boost::system::error_code error;
 		socket.close(error);
 		if (error) {
@@ -1231,6 +1491,11 @@ public:
 	// returns when write() can write at least one byte
 	Future<Void> onWritable() override {
 		++g_net2->countWriteProbes;
+#ifdef __linux__
+		if (uring) {
+			return uring->onWritable();
+		}
+#endif
 		BindPromise p("N2_WriteProbeError", id, peer_address);
 		auto f = p.getFuture();
 		socket.async_write_some(boost::asio::null_buffers(), std::move(p));
@@ -1240,6 +1505,11 @@ public:
 	// returns when read() can read at least one byte
 	Future<Void> onReadable() override {
 		++g_net2->countReadProbes;
+#ifdef __linux__
+		if (uring) {
+			return uring->onReadable();
+		}
+#endif
 		BindPromise p("N2_ReadProbeError", id, peer_address);
 		auto f = p.getFuture();
 		socket.async_read_some(boost::asio::null_buffers(), std::move(p));
@@ -1252,6 +1522,38 @@ public:
 		boost::system::error_code err;
 		++g_net2->countReads;
 		size_t toRead = end - begin;
+#ifdef __linux__
+		if (uring) {
+			int errnum = 0;
+			int n = uring->read(begin, end, errnum);
+			if (n == UringSocket::kControlRecord) {
+				// A non-data record: OpenSSL reads it (through the kernel TLS layer) and may return data after it.
+				n = static_cast<int>(opensslReadNonBlocking(begin, toRead, err));
+				if (!err || err == boost::asio::error::would_block) {
+					uring->resumeReceive();
+				}
+				if (err == boost::asio::error::would_block) {
+					++g_net2->countWouldBlock;
+					return 0;
+				}
+				if (err) {
+					onReadError(err);
+					throw connection_failed();
+				}
+			}
+			if (n > 0) {
+				g_net2->bytesReceived += n;
+				return n;
+			}
+			if (n == 0) {
+				++g_net2->countWouldBlock;
+				return 0;
+			}
+			onReadError(errnum ? boost::system::error_code(errnum, boost::system::system_category())
+			                   : boost::system::error_code(boost::asio::error::eof));
+			throw connection_failed();
+		}
+#endif
 		size_t size = opensslOwnsSocket ? opensslRead(begin, toRead, err)
 		                                : ssl_sock.read_some(boost::asio::mutable_buffer(begin, toRead), err);
 		g_net2->bytesReceived += size;
@@ -1279,6 +1581,20 @@ public:
 #endif
 		boost::system::error_code err;
 		++g_net2->countWrites;
+#ifdef __linux__
+		if (uring) {
+			int errnum = 0;
+			const int n = uring->write(data, limit, errnum);
+			if (n >= 0) {
+				if (n == 0) {
+					++g_net2->countWouldBlock;
+				}
+				return n;
+			}
+			onWriteError(boost::system::error_code(errnum, boost::system::system_category()));
+			throw connection_failed();
+		}
+#endif
 
 		size_t sent;
 		if (ktlsSend) {
@@ -1342,6 +1658,10 @@ private:
 	bool opensslOwnsSocket = false;
 	// Set after the handshake: the kernel encrypts sends, so writes bypass OpenSSL.
 	bool ktlsSend = false;
+#ifdef __linux__
+	// With FLOW_KNOBS->NET_IO_URING, once the kernel encrypts and decrypts both directions.
+	Reference<UringSocket> uring;
+#endif
 
 	void init() {
 		// Socket settings that have to be set after connect or accept succeeds
@@ -1378,6 +1698,10 @@ private:
 		countKtlsSend->increment(ktlsSend);
 		countKtlsRecv->increment(ktlsRecv);
 		countUserspaceTls->increment(!ktlsSend && !ktlsRecv);
+		if (ktlsSend && ktlsRecv) {
+			// Application data is now plain socket I/O.
+			uring = makeUringSocket(socket.native_handle(), /*kernelTls=*/true);
+		}
 		TraceEvent("N2_TLSKernelOffload", id)
 		    .suppressFor(60.0)
 		    .detail("PeerAddress", peer_address)
@@ -1419,6 +1743,18 @@ private:
 			}
 		}
 	}
+
+#ifdef __linux__
+	// opensslRead on the descriptor that NET_IO_URING keeps in blocking mode.
+	size_t opensslReadNonBlocking(uint8_t* begin, size_t toRead, boost::system::error_code& err) {
+		const int fd = socket.native_handle();
+		const int flags = fcntl(fd, F_GETFL);
+		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+		const size_t n = opensslRead(begin, toRead, err);
+		fcntl(fd, F_SETFL, flags);
+		return n;
+	}
+#endif
 
 	// SSL_read on the socket OpenSSL owns; returns 0 with err set, like ssl_socket::read_some.
 	size_t opensslRead(uint8_t* begin, size_t toRead, boost::system::error_code& err) {
@@ -1473,6 +1809,11 @@ private:
 	}
 
 	void closeSocket() {
+#ifdef __linux__
+		if (uring) {
+			uring->shutdownForClose();
+		}
+#endif
 		boost::system::error_code cancelError;
 		socket.cancel(cancelError);
 		boost::system::error_code closeError;
@@ -1763,6 +2104,11 @@ void Net2::run() {
 	TraceEvent("Net2Running").log();
 	thread_network = this;
 	dnsCacheRefreshActor = coordinatorDNSCacheRefresh(this);
+#ifdef __linux__
+	if (FLOW_KNOBS->NET_IO_URING || FLOW_KNOBS->KAIO_IO_URING) {
+		iouring::Ring::get();
+	}
+#endif
 
 	unsigned int tasksSinceReact = 0;
 
@@ -2406,7 +2752,63 @@ ASIOReactor::ASIOReactor(Net2* net) : do_not_stop(ios.get_executor()), network(n
 #endif
 }
 
+#ifdef __linux__
+namespace {
+// Asio keeps its epoll descriptor private; an explicit template instantiation may name private members.
+template <typename Tag, typename Tag::type Member>
+struct PrivateMember {
+	friend typename Tag::type privateMemberOf(Tag) { return Member; }
+};
+struct EpollFdTag {
+	using type = int boost::asio::detail::epoll_reactor::*;
+	friend type privateMemberOf(EpollFdTag);
+};
+template struct PrivateMember<EpollFdTag, &boost::asio::detail::epoll_reactor::epoll_fd_>;
+} // namespace
+
+int ASIOReactor::asioEpollFd() {
+	return boost::asio::use_service<boost::asio::detail::epoll_reactor>(ios).*privateMemberOf(EpollFdTag{});
+}
+#endif
+
 void ASIOReactor::sleep(double sleepTime) {
+#ifdef __linux__
+	if (iouring::Ring* ring = iouring::Ring::existing()) {
+		if (FLOW_KNOBS->NET_IO_URING) {
+			if (!ringLoop) {
+				ring->watchEpoll(asioEpollFd());
+				ringLoop = true;
+			}
+			// Handlers Asio already has queued (an operation that completed immediately, say) run without waiting.
+			if (ios.poll_one()) {
+				asioBusy = true;
+				++network->countASIOEvents;
+				return;
+			}
+			if (sleepTime > FLOW_KNOBS->BUSY_WAIT_THRESHOLD) {
+				setProfilingEnabled(0);
+				ring->wait(sleepTime - FLOW_KNOBS->BUSY_WAIT_THRESHOLD);
+				setProfilingEnabled(1);
+				++network->countASIOEvents;
+			} else {
+				ring->flush();
+				if (sleepTime > 0 && !(FLOW_KNOBS->REACTOR_FLAGS & 8)) {
+					threadYield();
+				}
+			}
+			return;
+		}
+		ring->flush();
+		if (!ringWatchArmed) {
+			if (!ringWatch) {
+				ringWatch = std::make_unique<boost::asio::posix::stream_descriptor>(ios, dup(ring->descriptor()));
+			}
+			ringWatchArmed = true;
+			ringWatch->async_wait(boost::asio::posix::stream_descriptor::wait_read,
+			                      [this](const boost::system::error_code&) { ringWatchArmed = false; });
+		}
+	}
+#endif
 	if (sleepTime > FLOW_KNOBS->BUSY_WAIT_THRESHOLD) {
 		if (FLOW_KNOBS->REACTOR_FLAGS & 4) {
 #ifdef __linux
@@ -2434,11 +2836,36 @@ void ASIOReactor::sleep(double sleepTime) {
 }
 
 void ASIOReactor::react() {
+#ifdef __linux__
+	if (iouring::Ring* ring = iouring::Ring::existing()) {
+		ring->flush();
+		ring->reap();
+		ring->maybeLogMetrics(timer_monotonic(), FLOW_KNOBS->IO_URING_METRICS_INTERVAL);
+		if (ringLoop) {
+			// Asio only has work when its epoll descriptor fired, another thread woke the loop, or sleep() ran one of
+			// its handlers.
+			const bool epollReady = ring->takeEpollReady();
+			const bool woken = ring->takeWoken();
+			if (asioBusy || epollReady || woken) {
+				asioBusy = false;
+				while (ios.poll_one())
+					++network->countASIOEvents;
+			}
+			return;
+		}
+	}
+#endif
 	while (ios.poll_one())
 		++network->countASIOEvents; // Make this a task?
 }
 
 void ASIOReactor::wake() {
+#ifdef __linux__
+	if (ringLoop) {
+		iouring::Ring::existing()->wake();
+		return;
+	}
+#endif
 	boost::asio::post(ios, nullCompletionHandler);
 }
 

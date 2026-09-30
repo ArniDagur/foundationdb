@@ -156,6 +156,11 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( DISABLE_MAINTHREAD_TLS_HANDSHAKE,                  false );
 	init( TLS_HANDSHAKE_FLOWLOCK_PRIORITY, static_cast<int>(TaskPriority::DefaultYield) );
 	init( TLS_USE_KTLS,                                      false );
+	init( NET_IO_URING,                                      false );
+	init( KAIO_IO_URING,                                     false );
+	init( IO_URING_ENTRIES,                                   4096 );
+	init( NET_IO_URING_RECV_BYTES,                           65536 );
+	init( IO_URING_METRICS_INTERVAL,                           5.0 );
 	init( NETWORK_TEST_CLIENT_COUNT,                            30 );
 	init( NETWORK_TEST_REPLY_SIZE,                           600e3 );
 	init( NETWORK_TEST_REQUEST_COUNT,                            0 ); // 0 -> run forever

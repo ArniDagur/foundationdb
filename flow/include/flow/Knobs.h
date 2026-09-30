@@ -235,6 +235,14 @@ public:
 	// built with kTLS support and the Linux tls module; each direction of a connection falls back to user-space TLS
 	// when the kernel does not support the negotiated cipher.
 	bool TLS_USE_KTLS;
+	// Proof of concept: socket I/O of TCP connections (and of TLS connections whose records the kernel encrypts and
+	// decrypts) goes through the network thread's io_uring, and the run loop waits on the ring instead of epoll.
+	bool NET_IO_URING;
+	// Proof of concept: KAIO reads, writes and fsyncs go through the network thread's io_uring instead of libaio.
+	bool KAIO_IO_URING;
+	int IO_URING_ENTRIES; // submission queue entries of the network thread's io_uring
+	int NET_IO_URING_RECV_BYTES; // receive buffer per connection with NET_IO_URING
+	double IO_URING_METRICS_INTERVAL; // seconds between IoUringMetrics trace events
 
 	int NETWORK_TEST_CLIENT_COUNT;
 	int NETWORK_TEST_REPLY_SIZE;

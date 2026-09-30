@@ -24,8 +24,13 @@
 // with a cipher the kernel cannot handle (--openssl-conf=cbc) the connection must fall back to user-space TLS. A
 // plain-OpenSSL client must interoperate with the Net2 server, and peer verification must still reject a client whose
 // chain has a different root. Writes to a connection shut down for writing must fail cleanly, not raise SIGPIPE.
+// Plain TCP connections get the same data checks, plus a sender that fills the socket while the receiver waits.
 //
-//   ktls_unittest [--main-thread-handshakes] [--openssl-conf=tls12|cbc]
+// With --net-io-uring (FLOW_KNOBS->NET_IO_URING), plain TCP connections and TLS connections whose records the kernel
+// handles in both directions must move their data through the network thread's io_uring (its receive and send
+// completion counters grow), and every other TLS connection must not touch it.
+//
+//   ktls_unittest [--net-io-uring] [--main-thread-handshakes] [--openssl-conf=tls12|cbc]
 
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +53,7 @@
 #include "flow/flow.h"
 #include "flow/Coroutines.h"
 #include "flow/IConnection.h"
+#include "flow/IoUring.h"
 #include "flow/Knobs.h"
 #include "flow/MkCert.h"
 #include "flow/Net2Packet.h"
@@ -179,7 +185,8 @@ struct RawClient {
 	}
 };
 
-Future<Void> sendAll(Reference<IConnection> conn, std::string data) {
+// Counts write() calls that returned 0 (socket full, or a send still in flight) into *blocked when given.
+Future<Void> sendAll(Reference<IConnection> conn, std::string data, int* blocked = nullptr) {
 	UnsentPacketQueue packets;
 	PacketWriter writer(packets.getWriteBuffer(data.size()), nullptr, Unversioned());
 	writer.serializeBytes(StringRef(reinterpret_cast<const uint8_t*>(data.data()), data.size()));
@@ -187,11 +194,37 @@ Future<Void> sendAll(Reference<IConnection> conn, std::string data) {
 		const int sent = conn->write(packets.getUnsent(), FLOW_KNOBS->MAX_PACKET_SEND_BYTES);
 		if (sent > 0) {
 			packets.sent(sent);
+		} else if (blocked) {
+			++*blocked;
 		}
 		if (!packets.empty()) {
 			co_await conn->onWritable();
 		}
 	}
+}
+
+// Receive and send completions on the network thread's io_uring so far.
+int64_t ringSocketCompletions() {
+	iouring::Ring* ring = iouring::Ring::existing();
+	if (!ring) {
+		return 0;
+	}
+	return ring->stats().completed[int(iouring::Kind::NetRecv)] + ring->stats().completed[int(iouring::Kind::NetSend)];
+}
+
+// The receiver only starts reading once the sender has filled the socket, so the sender must see write() return 0
+// and resume when the receiver drains it.
+Future<Void> backpressureCheck(Reference<IConnection> sender, Reference<IConnection> receiver, std::string label) {
+	const int size = 32 << 20;
+	const std::string data = pattern(size, 99);
+	int blocked = 0;
+	Future<Void> sent = sendAll(sender, data, &blocked);
+	co_await delay(0.3);
+	const std::string got = co_await receiveAll(receiver, size);
+	co_await sent;
+	check(got == data && blocked > 0,
+	      label + ": 32 MB into a receiver that waits: the sender blocked " + std::to_string(blocked) +
+	          " times, data intact");
 }
 
 Future<std::string> receiveAll(Reference<IConnection> conn, int size) {
@@ -262,9 +295,13 @@ Future<Void> rawClientCheck(Creds trusted, Creds stranger, std::string label) {
 
 // OpenSSL writes to sockets it owns without MSG_NOSIGNAL. Writing to a connection that is shut down for writing, in the
 // handshake or afterwards, must fail with connection_failed instead of killing the process with SIGPIPE.
-Future<Void> sigpipeCheck(std::string label) {
+Future<Void> sigpipeCheck(std::string label, bool tls = true) {
 	for (bool duringHandshake : { true, false }) {
-		Reference<IListener> listener = INetworkConnections::net()->listen(NetworkAddress::parse("127.0.0.1:0:tls"));
+		if (duringHandshake && !tls) {
+			continue;
+		}
+		Reference<IListener> listener =
+		    INetworkConnections::net()->listen(NetworkAddress::parse(tls ? "127.0.0.1:0:tls" : "127.0.0.1:0"));
 		Future<Reference<IConnection>> accepted = listener->accept();
 		Reference<IConnection> client = co_await INetworkConnections::net()->connect(listener->getListenAddress());
 		Reference<IConnection> server = co_await accepted;
@@ -276,7 +313,8 @@ Future<Void> sigpipeCheck(std::string label) {
 			} else {
 				co_await (client->connectHandshake() && server->acceptHandshake());
 				::shutdown(client->getSocket().native_handle(), SHUT_WR);
-				co_await sendAll(client, pattern(100000, 7));
+				// Several writes: with io_uring a send's error surfaces on the next write.
+				co_await sendAll(client, pattern(4 << 20, 7));
 			}
 		} catch (Error& e) {
 			failed = e.code() == error_code_connection_failed;
@@ -289,11 +327,17 @@ Future<Void> sigpipeCheck(std::string label) {
 	}
 }
 
-Future<Void> runOne(bool useKtls, bool expectKernel, std::string mode, Creds trusted, Creds stranger) {
+// One connection's checks. tls = false: a plain TCP connection. The ring must carry its data exactly when
+// expectRing.
+Future<Void>
+runOne(bool tls, bool useKtls, bool expectKernel, bool expectRing, std::string mode, Creds trusted, Creds stranger) {
 	const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_USE_KTLS = useKtls;
-	const std::string label = mode + (useKtls ? " knob on" : " knob off");
+	const std::string label =
+	    tls ? mode + (useKtls ? " knob on" : " knob off") : (FLOW_KNOBS->NET_IO_URING ? "tcp io_uring" : "tcp");
+	const int64_t ringBefore = ringSocketCompletions();
 
-	Reference<IListener> listener = INetworkConnections::net()->listen(NetworkAddress::parse("127.0.0.1:0:tls"));
+	Reference<IListener> listener =
+	    INetworkConnections::net()->listen(NetworkAddress::parse(tls ? "127.0.0.1:0:tls" : "127.0.0.1:0"));
 	Future<Reference<IConnection>> accepted = listener->accept();
 	Reference<IConnection> client = co_await INetworkConnections::net()->connect(listener->getListenAddress());
 	Reference<IConnection> server = co_await accepted;
@@ -301,7 +345,9 @@ Future<Void> runOne(bool useKtls, bool expectKernel, std::string mode, Creds tru
 
 	const KernelTlsState c = kernelTlsState(client);
 	const KernelTlsState s = kernelTlsState(server);
-	if (!useKtls) {
+	if (!tls) {
+		check(c.ulp.empty() && s.ulp.empty(), label + ": no TLS layer on either end");
+	} else if (!useKtls) {
 		check(c.ulp.empty() && s.ulp.empty(), label + ": no kernel TLS on either end");
 	} else if (expectKernel) {
 		check(c.ulp == "tls" && s.ulp == "tls", label + ": kernel TLS protocol on both ends");
@@ -324,6 +370,7 @@ Future<Void> runOne(bool useKtls, bool expectKernel, std::string mode, Creds tru
 		}
 		check((co_await got) == all, label + ": 1000 small writes intact");
 	}
+	co_await backpressureCheck(client, server, label);
 
 	// A closed peer surfaces as a read error, not a hang.
 	client->close();
@@ -341,19 +388,32 @@ Future<Void> runOne(bool useKtls, bool expectKernel, std::string mode, Creds tru
 	check(failed, label + ": peer close is reported as connection_failed");
 	server->close();
 
-	co_await rawClientCheck(trusted, stranger, label);
-	co_await sigpipeCheck(label);
+	if (tls) {
+		co_await rawClientCheck(trusted, stranger, label);
+	}
+	co_await sigpipeCheck(label, tls);
+
+	const int64_t ringCompletions = ringSocketCompletions() - ringBefore;
+	if (expectRing) {
+		check(ringCompletions > 0,
+		      label + ": data went through io_uring (" + std::to_string(ringCompletions) +
+		          " receive and send completions)");
+	} else {
+		check(ringCompletions == 0, label + ": io_uring not used for this connection's data");
+	}
 }
 
 Future<Void> runAll(std::string mode, bool kernelCipher, Creds trusted, int* rc) {
 	try {
 		const Creds stranger = makeCreds();
-		co_await runOne(false, false, mode, trusted, stranger);
+		const bool ring = FLOW_KNOBS->NET_IO_URING;
+		co_await runOne(false, false, false, ring, mode, trusted, stranger);
+		co_await runOne(true, false, false, false, mode, trusted, stranger);
 		const bool expectKernel = kernelCipher && kernelTlsAvailable();
 		if (kernelCipher && !expectKernel) {
 			std::printf("NOTE kernel tls module not loaded: knob-on run checks the user-space fallback only\n");
 		}
-		co_await runOne(true, expectKernel, mode, trusted, stranger);
+		co_await runOne(true, true, expectKernel, ring && expectKernel, mode, trusted, stranger);
 	} catch (Error& e) {
 		std::printf("FAIL %s: unexpected error %s\n", mode.c_str(), e.what());
 		++failures;
@@ -381,17 +441,21 @@ int main(int argc, char** argv) {
 	bool kernelCipher = true;
 	for (int i = 1; i < argc; i++) {
 		const std::string arg = argv[i];
-		if (arg == "--main-thread-handshakes") {
+		if (arg == "--net-io-uring") {
+			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING = true;
+			mode += " io_uring";
+		} else if (arg == "--main-thread-handshakes") {
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_SERVER_HANDSHAKE_THREADS = 0;
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_CLIENT_HANDSHAKE_THREADS = 0;
 			mode += " main-thread handshakes";
 		} else if (arg == "--openssl-conf=tls12" || arg == "--openssl-conf=cbc") {
 			const std::string which = arg.substr(arg.find('=') + 1);
 			useOpenSSLConf(which);
-			mode = which == "cbc" ? "tls12 aes-cbc" : "tls12";
+			mode = (which == "cbc" ? "tls12 aes-cbc" : "tls12") + mode.substr(5);
 			kernelCipher = which != "cbc";
 		} else {
-			std::fprintf(stderr, "usage: %s [--main-thread-handshakes] [--openssl-conf=tls12|cbc]\n", argv[0]);
+			std::fprintf(
+			    stderr, "usage: %s [--net-io-uring] [--main-thread-handshakes] [--openssl-conf=tls12|cbc]\n", argv[0]);
 			return 2;
 		}
 	}

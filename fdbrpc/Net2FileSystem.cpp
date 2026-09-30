@@ -42,6 +42,7 @@
 #include "flow/Platform.h"
 #include "AsyncFileWriteChecker.h"
 #include "flow/UnitTest.h"
+#include "flow/IoUring.h"
 
 #ifdef __linux__
 namespace {
@@ -390,6 +391,94 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/SplitRandomIO") {
 	knobs->KAIO_MAX_IOCBS_PER_SUBMIT = savedMaxIOCBsPerSubmit;
 	for (auto* b : bufs) {
 		freeFast4kAligned(maxOpBytes, b);
+	}
+	if (f) {
+		co_await AsyncFileEIO::deleteFile(filename, true);
+	}
+	if (err.present()) {
+		throw err.get();
+	}
+}
+
+// With KAIO_IO_URING, reads, writes and syncs must complete through the network thread's io_uring (the ring's disk
+// counters and KAIO's ring completions grow by exactly the requests made) and read back what was written, with many
+// requests in flight at once.
+TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
+	if (g_network->isSimulated()) {
+		co_return;
+	}
+	auto* knobs = const_cast<FlowKnobs*>(FLOW_KNOBS);
+	const bool saved = knobs->KAIO_IO_URING;
+	knobs->KAIO_IO_URING = true;
+	iouring::Ring* ring = iouring::Ring::get();
+	ASSERT(ring != nullptr);
+	constexpr int blockBytes = 16 << 10;
+	constexpr int slots = 256;
+	constexpr int rounds = 4;
+	std::vector<uint8_t*> bufs;
+	for (int i = 0; i < slots; i++) {
+		bufs.push_back(static_cast<uint8_t*>(allocateFast4kAligned(blockBytes)));
+	}
+	const std::string filename =
+	    format("/tmp/__KAIO_IOURING_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str());
+	Reference<IAsyncFile> f;
+	Optional<Error> err;
+	try {
+		f = co_await AsyncFileKAIO::open(filename,
+		                                 IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE |
+		                                     IAsyncFile::OPEN_CREATE,
+		                                 0666,
+		                                 nullptr);
+		co_await f->truncate(static_cast<int64_t>(slots) * blockBytes);
+		std::vector<uint8_t> expected(static_cast<size_t>(slots) * blockBytes);
+		const iouring::Stats before = ring->stats();
+		const int64_t completionsBefore = AsyncFileKAIO::getRingCompletions();
+		int reads = 0, writes = 0, syncs = 0;
+		for (int round = 0; round < rounds; round++) {
+			// Every slot written concurrently, then synced, then all read back concurrently.
+			std::vector<Future<Void>> pending;
+			for (int slot = 0; slot < slots; slot++) {
+				for (int j = 0; j < blockBytes; j++) {
+					bufs[slot][j] = static_cast<uint8_t>(deterministicRandom()->randomInt(0, 256));
+				}
+				memcpy(expected.data() + static_cast<size_t>(slot) * blockBytes, bufs[slot], blockBytes);
+				pending.push_back(f->write(bufs[slot], blockBytes, static_cast<int64_t>(slot) * blockBytes));
+				++writes;
+			}
+			co_await waitForAll(pending);
+			co_await f->sync();
+			++syncs;
+			for (int slot = 0; slot < slots; slot++) {
+				memset(bufs[slot], 0, blockBytes);
+			}
+			std::vector<Future<int>> readsDone;
+			for (int slot = 0; slot < slots; slot++) {
+				readsDone.push_back(f->read(bufs[slot], blockBytes, static_cast<int64_t>(slot) * blockBytes));
+				++reads;
+			}
+			co_await waitForAll(readsDone);
+			for (int slot = 0; slot < slots; slot++) {
+				ASSERT_EQ(readsDone[slot].get(), blockBytes);
+				ASSERT(memcmp(bufs[slot], expected.data() + static_cast<size_t>(slot) * blockBytes, blockBytes) == 0);
+			}
+		}
+		const iouring::Stats after = ring->stats();
+		auto submitted = [&](iouring::Kind k) { return after.submitted[int(k)] - before.submitted[int(k)]; };
+		auto completed = [&](iouring::Kind k) { return after.completed[int(k)] - before.completed[int(k)]; };
+		ASSERT_EQ(submitted(iouring::Kind::DiskWrite), writes);
+		ASSERT_EQ(completed(iouring::Kind::DiskWrite), writes);
+		ASSERT_EQ(submitted(iouring::Kind::DiskRead), reads);
+		ASSERT_EQ(completed(iouring::Kind::DiskRead), reads);
+		ASSERT_EQ(submitted(iouring::Kind::DiskFsync), syncs);
+		ASSERT_EQ(completed(iouring::Kind::DiskFsync), syncs);
+		ASSERT_EQ(AsyncFileKAIO::getRingCompletions() - completionsBefore, reads + writes + syncs);
+		printf("KAIO io_uring: %d writes, %d reads, %d syncs through the ring, data verified\n", writes, reads, syncs);
+	} catch (Error& e) {
+		err = e;
+	}
+	knobs->KAIO_IO_URING = saved;
+	for (auto* b : bufs) {
+		freeFast4kAligned(blockBytes, b);
 	}
 	if (f) {
 		co_await AsyncFileEIO::deleteFile(filename, true);

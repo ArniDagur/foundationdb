@@ -50,6 +50,15 @@ public:
 private:
 	Net2* network;
 	boost::asio::deadline_timer firstTimer;
+#ifdef __linux__
+	// FLOW_KNOBS->NET_IO_URING: the run loop waits on the io_uring, which watches Asio's epoll descriptor.
+	bool ringLoop = false;
+	bool asioBusy = false; // Asio ran a handler in sleep(), so it may have more ready
+	// Otherwise, while an io_uring exists (FLOW_KNOBS->KAIO_IO_URING), Asio watches the ring's descriptor.
+	std::unique_ptr<boost::asio::posix::stream_descriptor> ringWatch;
+	bool ringWatchArmed = false;
+	int asioEpollFd();
+#endif
 
 	static void nullWaitHandler(const boost::system::error_code&) {}
 	static void nullCompletionHandler() {}

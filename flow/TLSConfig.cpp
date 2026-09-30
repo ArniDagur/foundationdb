@@ -20,6 +20,7 @@
 
 #define PRIVATE_EXCEPT_FOR_TLSCONFIG_CPP
 #include "flow/TLSConfig.h"
+#include "flow/Knobs.h"
 #undef PRIVATE_EXCEPT_FOR_TLSCONFIG_CPP
 
 // To force typeinfo to only be emitted once.
@@ -121,6 +122,13 @@ void LoadedTLSConfig::print(FILE* fp) {
 void ConfigureSSLContext(const LoadedTLSConfig& loaded, boost::asio::ssl::context& context) {
 	try {
 		context.set_options(boost::asio::ssl::context::default_workarounds);
+#if defined(__linux__) && defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+		if (FLOW_KNOBS->TLS_USE_KTLS) {
+			// No TLS 1.3 session tickets: FDB does not resume sessions, and a ticket is a non-data record that a peer
+			// receiving through the kernel TLS layer must hand back to OpenSSL.
+			SSL_CTX_set_num_tickets(context.native_handle(), 0);
+		}
+#endif
 		auto verifyFailIfNoPeerCert = boost::asio::ssl::verify_fail_if_no_peer_cert;
 		// Servers get to accept connections without peer certs as "untrusted" clients
 		if (loaded.getEndpointType() == TLSEndpointType::SERVER)

@@ -21,6 +21,7 @@
 #pragma once
 #ifdef __linux__
 
+#include "flow/IoUring.h"
 #include "flow/IAsyncFile.h"
 
 #include <stdio.h>
@@ -421,7 +422,15 @@ public:
 
 		Future<Void> fsync;
 		const int mode = FLOW_KNOBS->KAIO_FDSYNC;
-		if (mode == 2 && ctx.fdsyncSupported && uringReady()) {
+		if (FLOW_KNOBS->KAIO_IO_URING && iouring::Ring::get()) {
+			// Queued like reads and writes and submitted to the network thread's ring by launch(). Callers only sync
+			// after their writes have completed, so no ordering against in-flight requests is needed.
+			IOBlock* io = new IOBlock(IO_CMD_FDSYNC, fd);
+			enqueue(io, "sync", this);
+			++ctx.fdsyncSubmitted;
+			fsync = throwErrorIfFailed(Reference<AsyncFileKAIO>::addRef(this),
+			                           fdsyncOrFallback(io->result.getFuture(), fd));
+		} else if (mode == 2 && ctx.fdsyncSupported && uringReady()) {
 			// Callers only sync after their writes have completed, so no ordering against in-flight iocbs is
 			// needed. The completion is posted to the KAIO eventfd and reaped by poll().
 			IOBlock* io = new IOBlock(IO_CMD_FDSYNC, fd);
@@ -539,7 +548,10 @@ public:
 				}
 			}
 			double truncateComplete = timer_monotonic();
-			int rc = submitIOCBs(toStart, n);
+			int rc = submitToRing(toStart, n);
+			if (rc < 0) {
+				rc = submitIOCBs(toStart, n);
+			}
 			double end = timer_monotonic();
 
 			if (end - begin > FLOW_KNOBS->SLOW_LOOP_CUTOFF) {
@@ -589,6 +601,66 @@ public:
 		}
 	}
 
+	// Queues toStart[0..n) on the network thread's io_uring when KAIO_IO_URING is set; the run loop submits them.
+	// Returns n, or -1 when the ring is not in use.
+	static int submitToRing(IOBlock** toStart, int n) {
+		if (!FLOW_KNOBS->KAIO_IO_URING) {
+			return -1;
+		}
+		iouring::Ring* ring = iouring::Ring::get();
+		if (!ring) {
+			return -1;
+		}
+		for (int i = 0; i < n; i++) {
+			IOBlock* io = toStart[i];
+			io_uring_sqe* sqe = ring->sqe();
+			iouring::Kind kind;
+			switch (io->aio_lio_opcode) {
+			case IO_CMD_PREAD:
+				iouring::prepRead(sqe, io->aio_fildes, io->buf, io->nbytes, io->offset);
+				kind = iouring::Kind::DiskRead;
+				break;
+			case IO_CMD_PWRITE:
+				iouring::prepWrite(sqe, io->aio_fildes, io->buf, io->nbytes, io->offset);
+				kind = iouring::Kind::DiskWrite;
+				break;
+			case IO_CMD_FDSYNC:
+				iouring::prepFsync(sqe, io->aio_fildes, /*datasync=*/true);
+				kind = iouring::Kind::DiskFsync;
+				break;
+			default:
+				UNREACHABLE();
+			}
+			ring->queue(sqe, &io->uringOp, kind);
+			ctx.submittedIOCBs++;
+		}
+		ctx.submitCalls++;
+		ctx.largestSubmitBatch = std::max<int64_t>(ctx.largestSubmitBatch, n);
+		return n;
+	}
+
+	// The io_uring counterpart of one completion in poll().
+	static void ringCompleted(IOBlock* iob, int32_t res) {
+		--ctx.outstanding;
+		++ctx.ringCompletions;
+		if (ctx.ioTimeout > 0) {
+			ctx.removeFromRequestList(iob);
+		}
+		const double currentTime = timer();
+		switch (iob->aio_lio_opcode) {
+		case IO_CMD_PREAD:
+			getMetrics().readLatencySample.addMeasurement(currentTime - iob->startTime);
+			break;
+		case IO_CMD_PWRITE:
+			getMetrics().writeLatencySample.addMeasurement(currentTime - iob->startTime);
+			break;
+		}
+		KAIOLogBlockEvent(iob, OpLogEntry::COMPLETE, res);
+		iob->setResult(res);
+	}
+
+	static int64_t getRingCompletions() { return ctx.ringCompletions; }
+
 	struct SubmitStats {
 		int64_t submitCalls;
 		int64_t submittedIOCBs;
@@ -615,8 +687,15 @@ private:
 	Int64MetricHandle countLogicalReads;
 
 	struct IOBlock : linux_iocb, FastAllocated<IOBlock> {
+		// Completion of this request when it was submitted to the network thread's io_uring (KAIO_IO_URING).
+		struct UringOp final : iouring::Op {
+			IOBlock* io = nullptr;
+			void complete(int32_t res) override { AsyncFileKAIO::ringCompleted(io, res); }
+		};
+
 		Promise<int> result;
 		Promise<Void> writeResult;
+		UringOp uringOp;
 		Reference<AsyncFileKAIO> owner;
 		int64_t prio;
 		IOBlock* prev;
@@ -637,6 +716,7 @@ private:
 			memset((linux_iocb*)this, 0, sizeof(linux_iocb));
 			aio_lio_opcode = op;
 			aio_fildes = fd;
+			uringOp.io = this;
 #if KAIO_LOGGING
 			iolog_id = 0;
 #endif
@@ -849,6 +929,7 @@ private:
 		int64_t submittedIOCBs;
 		int64_t largestSubmittedIOBytes;
 		int64_t largestSubmitBatch;
+		int64_t ringCompletions = 0;
 		Context()
 		  : iocx(0), evfd(-1), outstanding(0), ioStallBegin(0), fallocateSupported(true), fallocateZeroSupported(true),
 		    fdsyncSupported(true), fdsyncSubmitted(0), fdsyncFallbacks(0), submittedRequestList(nullptr), opsIssued(0),
