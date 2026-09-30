@@ -23,7 +23,8 @@
 // module available, both ends must have the kernel TLS upper-layer protocol with send and receive keys installed;
 // with a cipher the kernel cannot handle (--openssl-conf=cbc) the connection must fall back to user-space TLS. A
 // plain-OpenSSL client must interoperate with the Net2 server, and peer verification must still reject a client whose
-// chain has a different root. Writes to a connection shut down for writing must fail cleanly, not raise SIGPIPE.
+// chain has a different root. A handshake write to a connection shut down for writing, and data writes to a connection
+// the peer reset, must fail cleanly, not raise SIGPIPE.
 // Plain TCP connections get the same data checks, plus a sender that fills the socket while the receiver waits.
 //
 // With --net-io-uring (FLOW_KNOBS->NET_IO_URING), plain TCP connections and TLS connections whose records the kernel
@@ -297,8 +298,9 @@ Future<Void> rawClientCheck(Creds trusted, Creds stranger, std::string label) {
 	}
 }
 
-// OpenSSL writes to sockets it owns without MSG_NOSIGNAL. Writing to a connection that is shut down for writing, in the
-// handshake or afterwards, must fail with connection_failed instead of killing the process with SIGPIPE.
+// OpenSSL writes to sockets it owns without MSG_NOSIGNAL. A handshake write to a connection shut down for writing, and
+// data writes to a connection the peer reset, must fail with connection_failed instead of killing the process with
+// SIGPIPE.
 Future<Void> sigpipeCheck(std::string label, bool tls = true) {
 	for (bool duringHandshake : { true, false }) {
 		if (duringHandshake && !tls) {
@@ -317,8 +319,12 @@ Future<Void> sigpipeCheck(std::string label, bool tls = true) {
 				co_await client->connectHandshake();
 			} else {
 				co_await (client->connectHandshake() && server->acceptHandshake());
-				::shutdown(client->getSocket().native_handle(), SHUT_WR);
-				// Several writes: with io_uring a send's error surfaces on the next write.
+				// The peer resets the connection. The first send after that fails with ECONNRESET, later ones with
+				// EPIPE (the SIGPIPE case); a send's error surfaces on the next write with io_uring, so write several.
+				const linger reset{ 1, 0 };
+				setsockopt(server->getSocket().native_handle(), SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+				server->close();
+				co_await delay(0.1);
 				co_await sendAll(client, pattern(4 << 20, 7));
 			}
 		} catch (Error& e) {
@@ -326,8 +332,10 @@ Future<Void> sigpipeCheck(std::string label, bool tls = true) {
 			outcome = e.name();
 		}
 		check(failed,
-		      label + ": a " + (duringHandshake ? "handshake" : "data") +
-		          " write to a connection shut down for writing fails without SIGPIPE (" + outcome + ")");
+		      label + ": a " +
+		          (duringHandshake ? "handshake write to a connection shut down for writing"
+		                           : "data write to a connection the peer reset") +
+		          " fails without SIGPIPE (" + outcome + ")");
 		client->close();
 		server->close();
 	}
