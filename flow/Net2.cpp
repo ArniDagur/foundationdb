@@ -835,6 +835,22 @@ public:
 
 using ssl_socket = boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>;
 
+// OpenSSL writes to sockets it owns with write() and sendmsg() without MSG_NOSIGNAL, so writing to a connection the
+// peer has closed raises SIGPIPE, whose default action kills the process. With SIGPIPE blocked on the writing thread
+// the write fails with EPIPE instead; the signal stays pending there, which is harmless while it remains blocked.
+static void blockSigpipeOnThisThread() {
+#if defined(__unixish__)
+	thread_local bool blocked = false;
+	if (!blocked) {
+		sigset_t set;
+		sigemptyset(&set);
+		sigaddset(&set, SIGPIPE);
+		pthread_sigmask(SIG_BLOCK, &set, nullptr);
+		blocked = true;
+	}
+#endif
+}
+
 // Runs a blocking handshake directly with OpenSSL on a socket that OpenSSL owns (SSLConnection with kTLS).
 static void opensslHandshake(SSL* ssl, ssl_socket::handshake_type type, boost::system::error_code& err) {
 	if (type == ssl_socket::handshake_type::client) {
@@ -858,7 +874,7 @@ static void opensslHandshake(SSL* ssl, ssl_socket::handshake_type type, boost::s
 
 struct SSLHandshakerThread final : IThreadPoolReceiver {
 	SSLHandshakerThread() = default;
-	void init() override {}
+	void init() override { blockSigpipeOnThisThread(); }
 
 	struct Handshake final : TypedAction<SSLHandshakerThread, Handshake> {
 		Handshake(ssl_socket& socket, ssl_socket::handshake_type type) : socket(socket), type(type) {}
@@ -1340,6 +1356,7 @@ private:
 		if (!FLOW_KNOBS->TLS_USE_KTLS) {
 			return;
 		}
+		blockSigpipeOnThisThread();
 		SSL* ssl = ssl_sock.native_handle();
 		SSL_set_options(ssl, SSL_OP_ENABLE_KTLS);
 		opensslOwnsSocket = SSL_set_fd(ssl, socket.native_handle()) == 1;
