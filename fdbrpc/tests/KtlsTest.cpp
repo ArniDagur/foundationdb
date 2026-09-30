@@ -23,7 +23,7 @@
 // module available, both ends must have the kernel TLS upper-layer protocol with send and receive keys installed;
 // with a cipher the kernel cannot handle (--openssl-conf=cbc) the connection must fall back to user-space TLS. A
 // plain-OpenSSL client must interoperate with the Net2 server, and peer verification must still reject a client whose
-// chain has a different root.
+// chain has a different root. Writes to a connection shut down for writing must fail cleanly, not raise SIGPIPE.
 //
 //   ktls_unittest [--main-thread-handshakes] [--openssl-conf=tls12|cbc]
 
@@ -260,6 +260,35 @@ Future<Void> rawClientCheck(Creds trusted, Creds stranger, std::string label) {
 	}
 }
 
+// OpenSSL writes to sockets it owns without MSG_NOSIGNAL. Writing to a connection that is shut down for writing, in the
+// handshake or afterwards, must fail with connection_failed instead of killing the process with SIGPIPE.
+Future<Void> sigpipeCheck(std::string label) {
+	for (bool duringHandshake : { true, false }) {
+		Reference<IListener> listener = INetworkConnections::net()->listen(NetworkAddress::parse("127.0.0.1:0:tls"));
+		Future<Reference<IConnection>> accepted = listener->accept();
+		Reference<IConnection> client = co_await INetworkConnections::net()->connect(listener->getListenAddress());
+		Reference<IConnection> server = co_await accepted;
+		bool failed = false;
+		try {
+			if (duringHandshake) {
+				::shutdown(client->getSocket().native_handle(), SHUT_WR);
+				co_await client->connectHandshake();
+			} else {
+				co_await (client->connectHandshake() && server->acceptHandshake());
+				::shutdown(client->getSocket().native_handle(), SHUT_WR);
+				co_await sendAll(client, pattern(100000, 7));
+			}
+		} catch (Error& e) {
+			failed = e.code() == error_code_connection_failed;
+		}
+		check(failed,
+		      label + ": a " + (duringHandshake ? "handshake" : "data") +
+		          " write to a connection shut down for writing fails without SIGPIPE");
+		client->close();
+		server->close();
+	}
+}
+
 Future<Void> runOne(bool useKtls, bool expectKernel, std::string mode, Creds trusted, Creds stranger) {
 	const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_USE_KTLS = useKtls;
 	const std::string label = mode + (useKtls ? " knob on" : " knob off");
@@ -313,6 +342,7 @@ Future<Void> runOne(bool useKtls, bool expectKernel, std::string mode, Creds tru
 	server->close();
 
 	co_await rawClientCheck(trusted, stranger, label);
+	co_await sigpipeCheck(label);
 }
 
 Future<Void> runAll(std::string mode, bool kernelCipher, Creds trusted, int* rc) {
