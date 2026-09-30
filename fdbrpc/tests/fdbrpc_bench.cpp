@@ -155,6 +155,9 @@ private:
 
 class EchoServer {
 	static void rethrowUnexpectedError(const Error& e) {
+		if (e.code() == error_code_actor_cancelled) {
+			throw e;
+		}
 		if (e.code() != error_code_operation_obsolete) {
 			fprintf(stderr, "Error: %s\n", e.what());
 			throw e;
