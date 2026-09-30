@@ -259,9 +259,9 @@ var _ = Describe("Testing FDB Kubernetes Monitor API", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result).To(Equal(expected))
 		},
-		Entry("adds the values",
-			`{"type": "Sum", "values": [{"type": "Environment", "source": "FDB_PORT_BLOCK_START"}, {"type": "ProcessNumber", "multiplier": 2, "offset": -2}]}`,
-			"4534", ""),
+		Entry("adds positive and negative values",
+			`{"type": "Sum", "values": [{"type": "Environment", "source": "FDB_PORT_BLOCK_START"}, {"type": "ProcessNumber", "multiplier": 2, "offset": -2}, {"value": "-1"}]}`,
+			"4533", ""),
 		Entry("rejects values that are not integers",
 			`{"type": "Sum", "values": [{"type": "Environment", "source": "FDB_PUBLIC_IP"}]}`,
 			"", `value "10.0.0.1" of sum argument is not an integer`),
