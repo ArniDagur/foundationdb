@@ -235,14 +235,14 @@ Future<Void> backpressureCheck(Reference<IConnection> sender, Reference<IConnect
 	const int small = 64 << 10;
 	setsockopt(sender->getSocket().native_handle(), SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
 	setsockopt(receiver->getSocket().native_handle(), SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
-	int blocked = 0;
-	Future<Void> sent = sendAll(sender, data, &blocked);
+	Future<Void> sent = sendAll(sender, data);
 	co_await delay(0.3);
+	const bool stalled = !sent.isReady();
 	const std::string got = co_await receiveAll(receiver, size);
 	co_await sent;
-	check(got == data && blocked > 0,
-	      label + ": 32 MB into a receiver that waits: the sender blocked " + std::to_string(blocked) +
-	          " times, data intact");
+	check(got == data && stalled,
+	      label + ": 32 MB into a receiver that waits: the sender " + (stalled ? "stalled" : "did not stall") +
+	          " until it read, data intact");
 }
 
 // Sends patterned payloads in both directions at once and checks that both arrive intact.
@@ -310,6 +310,7 @@ Future<Void> sigpipeCheck(std::string label, bool tls = true) {
 		Reference<IConnection> client = co_await INetworkConnections::net()->connect(listener->getListenAddress());
 		Reference<IConnection> server = co_await accepted;
 		bool failed = false;
+		std::string outcome = "completed";
 		try {
 			if (duringHandshake) {
 				::shutdown(client->getSocket().native_handle(), SHUT_WR);
@@ -322,10 +323,11 @@ Future<Void> sigpipeCheck(std::string label, bool tls = true) {
 			}
 		} catch (Error& e) {
 			failed = e.code() == error_code_connection_failed;
+			outcome = e.name();
 		}
 		check(failed,
 		      label + ": a " + (duringHandshake ? "handshake" : "data") +
-		          " write to a connection shut down for writing fails without SIGPIPE");
+		          " write to a connection shut down for writing fails without SIGPIPE (" + outcome + ")");
 		client->close();
 		server->close();
 	}
