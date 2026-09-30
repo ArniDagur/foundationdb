@@ -1698,6 +1698,15 @@ private:
 		countKtlsSend->increment(ktlsSend);
 		countKtlsRecv->increment(ktlsRecv);
 		countUserspaceTls->increment(!ktlsSend && !ktlsRecv);
+		if (ktlsRecv && SSL_version(ssl) == TLS1_3_VERSION) {
+			// OpenSSL does not pad TLS 1.3 records, so the kernel may decrypt straight into the reader's buffer
+			// (kernel 6.0+; a padded record is still handled, only more slowly).
+			const int one = 1;
+			static SimpleCounter<int64_t>* countNoPad = SimpleCounter<int64_t>::makeCounter("/Net2/TLS/KtlsRxNoPad");
+			countNoPad->increment(
+			    setsockopt(
+			        socket.native_handle(), 282 /* SOL_TLS */, 4 /* TLS_RX_EXPECT_NO_PAD */, &one, sizeof(one)) == 0);
+		}
 		if (ktlsSend && ktlsRecv) {
 			// Application data is now plain socket I/O.
 			uring = makeUringSocket(socket.native_handle(), /*kernelTls=*/true);

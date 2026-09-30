@@ -36,6 +36,32 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+// Newer than the oldest kernel headers FDB builds against; the ring falls back when the kernel rejects them.
+#ifndef IORING_SETUP_SUBMIT_ALL
+#define IORING_SETUP_SUBMIT_ALL (1U << 7)
+#endif
+#ifndef IORING_SETUP_COOP_TASKRUN
+#define IORING_SETUP_COOP_TASKRUN (1U << 8)
+#endif
+#ifndef IORING_SETUP_TASKRUN_FLAG
+#define IORING_SETUP_TASKRUN_FLAG (1U << 9)
+#endif
+#ifndef IORING_SETUP_SINGLE_ISSUER
+#define IORING_SETUP_SINGLE_ISSUER (1U << 12)
+#endif
+#ifndef IORING_SETUP_DEFER_TASKRUN
+#define IORING_SETUP_DEFER_TASKRUN (1U << 13)
+#endif
+#ifndef IORING_SQ_TASKRUN
+#define IORING_SQ_TASKRUN (1U << 2)
+#endif
+#ifndef IORING_ENTER_REGISTERED_RING
+#define IORING_ENTER_REGISTERED_RING (1U << 4)
+#endif
+#ifndef IORING_REGISTER_RING_FDS
+#define IORING_REGISTER_RING_FDS 20
+#endif
+
 namespace iouring {
 
 namespace {
@@ -73,16 +99,38 @@ Ring* Ring::get() {
 }
 
 bool Ring::init(unsigned entries) {
+	// Most capable setup first: completions posted only while this (the only submitting) thread is in
+	// io_uring_enter (no inter-processor interrupts or task work while it runs Flow tasks) and the whole batch
+	// submitted even if one entry fails; then cooperative task running (5.19); then the 5.15 baseline.
+	const unsigned base = IORING_SETUP_CQSIZE;
+	const unsigned attempts[] = {
+		base | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+		    IORING_SETUP_TASKRUN_FLAG,
+		base | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG,
+		base,
+	};
 	io_uring_params p;
-	memset(&p, 0, sizeof(p));
-	p.flags = IORING_SETUP_CQSIZE;
-	// Every connection keeps a receive in flight, so completions can far outnumber one batch of submissions.
-	p.cq_entries = entries * 4;
-	const int ringFd = syscall(__NR_io_uring_setup, entries, &p);
+	int ringFd = -1;
+	for (unsigned flags : attempts) {
+		if ((flags & IORING_SETUP_DEFER_TASKRUN) && !FLOW_KNOBS->NET_IO_URING) {
+			// Without the ring loop, Asio waits in epoll and only reaps; completions must post on their own.
+			continue;
+		}
+		memset(&p, 0, sizeof(p));
+		p.flags = flags;
+		// Every connection keeps a receive in flight, so completions can far outnumber one batch of submissions.
+		p.cq_entries = entries * 4;
+		ringFd = syscall(__NR_io_uring_setup, entries, &p);
+		if (ringFd >= 0 || errno != EINVAL) {
+			break;
+		}
+	}
 	if (ringFd < 0) {
 		TraceEvent(SevWarnAlways, "IoUringSetupFailed").GetLastError();
 		return false;
 	}
+	setupFlags = p.flags;
+	deferTaskrun = (p.flags & IORING_SETUP_DEFER_TASKRUN) != 0;
 	if (!(p.features & IORING_FEAT_EXT_ARG) || !(p.features & IORING_FEAT_NODROP)) {
 		TraceEvent(SevWarnAlways, "IoUringSetupFailed").detail("Reason", "kernel lacks EXT_ARG or NODROP");
 		::close(ringFd);
@@ -143,16 +191,35 @@ bool Ring::init(unsigned entries) {
 	}
 	wakeOp.ring = this;
 	epollOp.ring = this;
+
+	// A registered ring descriptor spares io_uring_enter the file table lookup (5.18).
+	io_uring_rsrc_update reg;
+	memset(&reg, 0, sizeof(reg));
+	reg.offset = -1U;
+	reg.data = static_cast<uint64_t>(fd);
+	if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_RING_FDS, &reg, 1) == 1) {
+		enterFd = reg.offset;
+		enterFlags = IORING_ENTER_REGISTERED_RING;
+	} else {
+		enterFd = fd;
+	}
 	TraceEvent("IoUringReady")
 	    .detail("SQEntries", p.sq_entries)
 	    .detail("CQEntries", p.cq_entries)
-	    .detail("Features", p.features);
+	    .detail("Features", p.features)
+	    .detail("SetupFlags", setupFlags)
+	    .detail("DeferTaskrun", deferTaskrun)
+	    .detail("RegisteredRing", enterFlags != 0);
 	return true;
 }
 
 int Ring::enter(unsigned toSubmit, unsigned minComplete, unsigned flags, const void* arg, unsigned argSize) {
 	++counters.enters;
-	return syscall(__NR_io_uring_enter, fd, toSubmit, minComplete, flags, arg, argSize);
+	return syscall(__NR_io_uring_enter, enterFd, toSubmit, minComplete, flags | enterFlags, arg, argSize);
+}
+
+bool Ring::taskWorkPending() const {
+	return (__atomic_load_n(sqFlags, __ATOMIC_RELAXED) & (IORING_SQ_TASKRUN | IORING_SQ_CQ_OVERFLOW)) != 0;
 }
 
 io_uring_sqe* Ring::sqe() {
@@ -174,8 +241,14 @@ void Ring::queue(io_uring_sqe* s, Op* op, Kind kind) {
 }
 
 void Ring::flush() {
+	if (unsubmitted == 0 && taskWorkPending()) {
+		// Completions (deferred task work) are waiting to be posted.
+		enter(0, 0, IORING_ENTER_GETEVENTS, nullptr, 0);
+		return;
+	}
 	for (int attempt = 0; unsubmitted > 0 && attempt < 100; attempt++) {
-		const int n = enter(unsubmitted, 0, 0, nullptr, 0);
+		// GETEVENTS also posts pending completions, so the reap() that follows sees them.
+		const int n = enter(unsubmitted, 0, IORING_ENTER_GETEVENTS, nullptr, 0);
 		if (n > 0) {
 			unsubmitted -= n;
 		} else if (n < 0 && (errno == EBUSY || errno == EAGAIN)) {
@@ -237,8 +310,8 @@ int Ring::reap() {
 		unsigned head = *cqHead;
 		const unsigned tail = __atomic_load_n(cqTail, __ATOMIC_ACQUIRE);
 		if (head == tail) {
-			if (__atomic_load_n(sqFlags, __ATOMIC_RELAXED) & IORING_SQ_CQ_OVERFLOW) {
-				// Completions that did not fit were kept by the kernel (IORING_FEAT_NODROP); fetch them.
+			if (taskWorkPending()) {
+				// Completions that did not fit (kept by the kernel under IORING_FEAT_NODROP) or deferred task work.
 				enter(0, 0, IORING_ENTER_GETEVENTS, nullptr, 0);
 				if (*cqHead != __atomic_load_n(cqTail, __ATOMIC_ACQUIRE)) {
 					continue;

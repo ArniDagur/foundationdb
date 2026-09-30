@@ -93,6 +93,7 @@ private:
 	Ring() = default;
 	bool init(unsigned entries);
 	int enter(unsigned toSubmit, unsigned minComplete, unsigned flags, const void* arg, unsigned argSize);
+	bool taskWorkPending() const;
 	void armInternal();
 
 	struct InternalOp : Op {
@@ -103,6 +104,10 @@ private:
 	};
 
 	int fd = -1;
+	int enterFd = -1; // registered index with enterFlags = IORING_ENTER_REGISTERED_RING, else fd
+	unsigned enterFlags = 0;
+	unsigned setupFlags = 0;
+	bool deferTaskrun = false;
 	unsigned sqEntries = 0;
 	unsigned* sqHead = nullptr;
 	unsigned* sqTail = nullptr;

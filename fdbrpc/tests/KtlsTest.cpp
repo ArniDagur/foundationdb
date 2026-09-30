@@ -212,6 +212,20 @@ int64_t ringSocketCompletions() {
 	return ring->stats().completed[int(iouring::Kind::NetRecv)] + ring->stats().completed[int(iouring::Kind::NetSend)];
 }
 
+Future<std::string> receiveAll(Reference<IConnection> conn, int size) {
+	std::string got(size, '\0');
+	int have = 0;
+	while (have < size) {
+		const int n = conn->read(reinterpret_cast<uint8_t*>(got.data()) + have,
+		                         reinterpret_cast<uint8_t*>(got.data()) + std::min(size, have + (1 << 20)));
+		have += n;
+		if (n == 0) {
+			co_await conn->onReadable();
+		}
+	}
+	co_return got;
+}
+
 // The receiver only starts reading once the sender has filled the socket, so the sender must see write() return 0
 // and resume when the receiver drains it.
 Future<Void> backpressureCheck(Reference<IConnection> sender, Reference<IConnection> receiver, std::string label) {
@@ -225,20 +239,6 @@ Future<Void> backpressureCheck(Reference<IConnection> sender, Reference<IConnect
 	check(got == data && blocked > 0,
 	      label + ": 32 MB into a receiver that waits: the sender blocked " + std::to_string(blocked) +
 	          " times, data intact");
-}
-
-Future<std::string> receiveAll(Reference<IConnection> conn, int size) {
-	std::string got(size, '\0');
-	int have = 0;
-	while (have < size) {
-		const int n = conn->read(reinterpret_cast<uint8_t*>(got.data()) + have,
-		                         reinterpret_cast<uint8_t*>(got.data()) + std::min(size, have + (1 << 20)));
-		have += n;
-		if (n == 0) {
-			co_await conn->onReadable();
-		}
-	}
-	co_return got;
 }
 
 // Sends patterned payloads in both directions at once and checks that both arrive intact.
