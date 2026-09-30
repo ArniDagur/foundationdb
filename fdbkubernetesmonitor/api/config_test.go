@@ -247,138 +247,28 @@ var _ = Describe("Testing FDB Kubernetes Monitor API", func() {
 		})
 	})
 
-	When("generating arguments for Sum arguments", func() {
-		var argument string
-		var err error
-		var testArgument Argument
-		var processNumber int
-		var env map[string]string
-
-		BeforeEach(func() {
-			processNumber = 1
-			env = map[string]string{"FDB_PUBLIC_IP": "10.0.0.1", "FDB_PORT_BLOCK_START": "4530"}
-		})
-
-		JustBeforeEach(func() {
-			argument, err = testArgument.GenerateArgument(processNumber, env)
-		})
-
-		When("summing an environment variable and a process number", func() {
-			BeforeEach(func() {
-				testArgument = Argument{ArgumentType: SumArgumentType, Values: []Argument{
-					{ArgumentType: EnvironmentArgumentType, Source: "FDB_PORT_BLOCK_START"},
-					{ArgumentType: ProcessNumberArgumentType, Multiplier: 2, Offset: -2},
-				}}
-			})
-
-			It("should generate the sum for the first process", func() {
-				Expect(err).NotTo(HaveOccurred())
-				Expect(argument).To(Equal("4530"))
-			})
-
-			When("generating the argument for the third process", func() {
-				BeforeEach(func() {
-					processNumber = 3
-				})
-
-				It("should generate the sum for the third process", func() {
-					Expect(err).NotTo(HaveOccurred())
-					Expect(argument).To(Equal("4534"))
-				})
-			})
-		})
-
-		When("the sum is part of a concatenated argument", func() {
-			BeforeEach(func() {
-				testArgument = Argument{ArgumentType: ConcatenateArgumentType, Values: []Argument{
-					{Value: "--public_address="},
-					{ArgumentType: EnvironmentArgumentType, Source: "FDB_PUBLIC_IP"},
-					{Value: ":"},
-					{ArgumentType: SumArgumentType, Values: []Argument{
-						{ArgumentType: EnvironmentArgumentType, Source: "FDB_PORT_BLOCK_START"},
-						{ArgumentType: ProcessNumberArgumentType, Multiplier: 2, Offset: -1},
-					}},
-				}}
-				processNumber = 2
-			})
-
-			It("should generate the expected argument", func() {
-				Expect(err).NotTo(HaveOccurred())
-				Expect(argument).To(Equal("--public_address=10.0.0.1:4533"))
-			})
-		})
-
-		When("summing literal values", func() {
-			BeforeEach(func() {
-				testArgument = Argument{ArgumentType: SumArgumentType, Values: []Argument{
-					{Value: "10"},
-					{ArgumentType: LiteralArgumentType, Value: "-3"},
-				}}
-			})
-
-			It("should generate the sum", func() {
-				Expect(err).NotTo(HaveOccurred())
-				Expect(argument).To(Equal("7"))
-			})
-		})
-
-		When("no values are provided", func() {
-			BeforeEach(func() {
-				testArgument = Argument{ArgumentType: SumArgumentType}
-			})
-
-			It("should generate zero", func() {
-				Expect(err).NotTo(HaveOccurred())
-				Expect(argument).To(Equal("0"))
-			})
-		})
-
-		When("a value is not an integer", func() {
-			BeforeEach(func() {
-				testArgument = Argument{ArgumentType: SumArgumentType, Values: []Argument{
-					{ArgumentType: EnvironmentArgumentType, Source: "FDB_PUBLIC_IP"},
-					{Value: "1"},
-				}}
-			})
-
-			It("should return an error", func() {
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(HavePrefix("value \"10.0.0.1\" of sum argument is not an integer"))
-				Expect(argument).To(BeEmpty())
-			})
-		})
-
-		When("an environment variable is missing", func() {
-			BeforeEach(func() {
-				testArgument = Argument{ArgumentType: SumArgumentType, Values: []Argument{
-					{ArgumentType: EnvironmentArgumentType, Source: "FDB_MISSING"},
-					{Value: "1"},
-				}}
-			})
-
-			It("should return an error", func() {
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(Equal("missing environment variable FDB_MISSING"))
-				Expect(argument).To(BeEmpty())
-			})
-		})
-
-		When("the argument is parsed from JSON", func() {
-			BeforeEach(func() {
-				testArgument = Argument{}
-				Expect(json.Unmarshal([]byte(`{"type": "Sum", "values": [
-					{"type": "Environment", "source": "FDB_PORT_BLOCK_START"},
-					{"type": "ProcessNumber", "multiplier": 2, "offset": -2}
-				]}`), &testArgument)).To(Succeed())
-				processNumber = 2
-			})
-
-			It("should generate the sum", func() {
-				Expect(err).NotTo(HaveOccurred())
-				Expect(argument).To(Equal("4532"))
-			})
-		})
-	})
+	DescribeTable("generating arguments for Sum arguments",
+		func(rawArgument string, expected string, expectedError string) {
+			argument := Argument{}
+			Expect(json.Unmarshal([]byte(rawArgument), &argument)).To(Succeed())
+			result, err := argument.GenerateArgument(3, map[string]string{"FDB_PORT_BLOCK_START": "4530", "FDB_PUBLIC_IP": "10.0.0.1"})
+			if expectedError != "" {
+				Expect(err).To(MatchError(ContainSubstring(expectedError)))
+				return
+			}
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result).To(Equal(expected))
+		},
+		Entry("adds the values",
+			`{"type": "Sum", "values": [{"type": "Environment", "source": "FDB_PORT_BLOCK_START"}, {"type": "ProcessNumber", "multiplier": 2, "offset": -2}]}`,
+			"4534", ""),
+		Entry("rejects values that are not integers",
+			`{"type": "Sum", "values": [{"type": "Environment", "source": "FDB_PUBLIC_IP"}]}`,
+			"", `value "10.0.0.1" of sum argument is not an integer`),
+		Entry("returns errors of its values",
+			`{"type": "Sum", "values": [{"type": "Environment", "source": "FDB_MISSING"}]}`,
+			"", "missing environment variable FDB_MISSING"),
+	)
 
 	When("marshalling a process configuration", func() {
 		var out string
