@@ -99,8 +99,9 @@ public:
 	bool hasBufferRing() const { return bufRing != nullptr; }
 	uint8_t* bufferData(uint16_t bid) const { return bufMem + size_t(bid) * bufSize; }
 	void recycleBuffer(uint16_t bid);
-	// Calls waiter->buffersAvailable() once, after the next recycleBuffer(), unless cancelled first.
-	void waitForBuffers(BufferWaiter* waiter);
+	// For a receive that ran out of buffers: false when some have come back since (the caller may re-arm at once);
+	// otherwise calls waiter->buffersAvailable() once, after the next recycleBuffer(), unless cancelled first.
+	bool waitForBuffers(BufferWaiter* waiter);
 	void cancelBufferWait(BufferWaiter* waiter);
 	void noteRecvNoBuffers() { ++counters.recvNoBuffers; }
 
@@ -159,6 +160,7 @@ private:
 	unsigned bufSize = 0;
 	uint8_t* bufMem = nullptr;
 	uint16_t bufTail = 0;
+	unsigned bufOutstanding = 0; // handed out in completions and not yet recycled
 	std::vector<BufferWaiter*> bufferWaiters;
 
 	Stats counters;

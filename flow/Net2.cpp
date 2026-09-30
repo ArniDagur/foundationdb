@@ -650,8 +650,8 @@ private:
 			// Every provided buffer holds data not yet read; re-arm once one comes back.
 			ring->noteRecvNoBuffers();
 			if (!closed) {
-				waitingForBuffers = true;
-				ring->waitForBuffers(this);
+				waitingForBuffers = ring->waitForBuffers(this);
+				armReceive();
 			}
 			return;
 		} else if (res == -EIO && kernelTls && !closed) {

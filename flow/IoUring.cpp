@@ -275,6 +275,7 @@ void Ring::initBufferRing() {
 	bufCount = count;
 	bufSize = size;
 	bufMem = static_cast<uint8_t*>(mem);
+	bufOutstanding = count;
 	for (unsigned i = 0; i < count; i++) {
 		recycleBuffer(uint16_t(i));
 	}
@@ -287,6 +288,7 @@ void Ring::recycleBuffer(uint16_t bid) {
 	e.bid = bid;
 	++bufTail;
 	__atomic_store_n(bufRingTail, bufTail, __ATOMIC_RELEASE);
+	--bufOutstanding;
 	if (!bufferWaiters.empty()) {
 		std::vector<BufferWaiter*> waiters;
 		waiters.swap(bufferWaiters);
@@ -296,8 +298,14 @@ void Ring::recycleBuffer(uint16_t bid) {
 	}
 }
 
-void Ring::waitForBuffers(BufferWaiter* waiter) {
+bool Ring::waitForBuffers(BufferWaiter* waiter) {
+	// Completions run their callbacks inline, so buffers may have been read and recycled between the kernel finding
+	// the ring empty and this call; then nothing would wake the waiter.
+	if (bufOutstanding < bufCount) {
+		return false;
+	}
 	bufferWaiters.push_back(waiter);
+	return true;
 }
 
 void Ring::cancelBufferWait(BufferWaiter* waiter) {
@@ -417,6 +425,9 @@ int Ring::reap() {
 			__atomic_store_n(cqHead, head, __ATOMIC_RELEASE);
 			const int kind = int(cqe.user_data & kKindMask);
 			++counters.completed[kind];
+			if (cqe.flags & IORING_CQE_F_BUFFER) {
+				++bufOutstanding;
+			}
 			reinterpret_cast<Op*>(cqe.user_data & ~kKindMask)->complete(cqe.res, cqe.flags);
 			++total;
 		}
