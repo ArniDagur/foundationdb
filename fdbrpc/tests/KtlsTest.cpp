@@ -21,19 +21,27 @@
 // Loopback TLS connections through Net2, with FLOW_KNOBS->TLS_USE_KTLS off and on. Payloads of many sizes, sent as
 // multi-buffer packet chains in both directions at once, must arrive intact. With the knob on and the kernel tls
 // module available, both ends must have the kernel TLS upper-layer protocol with send and receive keys installed;
-// with a cipher the kernel cannot handle (--openssl-conf=cbc) the connection must fall back to user-space TLS.
+// with a cipher the kernel cannot handle (--openssl-conf=cbc) the connection must fall back to user-space TLS. A
+// plain-OpenSSL client must interoperate with the Net2 server, and peer verification must still reject a client whose
+// chain has a different root.
 //
 //   ktls_unittest [--main-thread-handshakes] [--openssl-conf=tls12|cbc]
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <linux/tls.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netinet/tcp.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -96,6 +104,81 @@ std::string pattern(int size, int seed) {
 	return s;
 }
 
+struct Creds {
+	std::string cert; // the chain without its root
+	std::string key;
+	std::string ca; // the root
+};
+
+Creds makeCreds() {
+	auto arena = Arena();
+	auto chain = mkcert::makeCertChain(arena, mkcert::makeCertChainSpec(arena, 2, mkcert::ESide::Server), {});
+	auto nonRoot = chain;
+	nonRoot.pop_back();
+	return Creds{ concatCertChain(arena, nonRoot).toString(),
+		          chain.front().privateKeyPem.toString(),
+		          chain.back().certPem.toString() };
+}
+
+// A blocking plain-OpenSSL client on its own thread, presenting `own` and trusting `trusted.ca`: sends "ping" and
+// expects "pong" back. Sets done when finished; ok when the exchange completed.
+struct RawClient {
+	std::atomic<bool> done{ false };
+	std::atomic<bool> ok{ false };
+	std::thread thread;
+
+	void start(uint16_t port, Creds own, std::string trustedCa) {
+		thread = std::thread([this, port, own, trustedCa]() {
+			ok = run(port, own, trustedCa);
+			done = true;
+		});
+	}
+
+	static bool run(uint16_t port, const Creds& own, const std::string& trustedCa) {
+		SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+		BIO* certBio = BIO_new_mem_buf(own.cert.data(), own.cert.size());
+		X509* cert = PEM_read_bio_X509(certBio, nullptr, nullptr, nullptr);
+		BIO* keyBio = BIO_new_mem_buf(own.key.data(), own.key.size());
+		EVP_PKEY* key = PEM_read_bio_PrivateKey(keyBio, nullptr, nullptr, nullptr);
+		BIO* caBio = BIO_new_mem_buf(trustedCa.data(), trustedCa.size());
+		X509* ca = PEM_read_bio_X509(caBio, nullptr, nullptr, nullptr);
+		SSL_CTX_use_certificate(ctx, cert);
+		SSL_CTX_use_PrivateKey(ctx, key);
+		X509_STORE_add_cert(SSL_CTX_get_cert_store(ctx), ca);
+		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+		bool result = false;
+		const int fd = socket(AF_INET, SOCK_STREAM, 0);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(port);
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		SSL* ssl = SSL_new(ctx);
+		if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 && SSL_set_fd(ssl, fd) == 1 &&
+		    SSL_connect(ssl) == 1 && SSL_write(ssl, "ping", 4) == 4) {
+			char reply[4];
+			int have = 0;
+			while (have < 4) {
+				const int n = SSL_read(ssl, reply + have, 4 - have);
+				if (n <= 0) {
+					break;
+				}
+				have += n;
+			}
+			result = have == 4 && memcmp(reply, "pong", 4) == 0;
+		}
+		SSL_free(ssl);
+		close(fd);
+		X509_free(ca);
+		EVP_PKEY_free(key);
+		X509_free(cert);
+		BIO_free(caBio);
+		BIO_free(keyBio);
+		BIO_free(certBio);
+		SSL_CTX_free(ctx);
+		return result;
+	}
+};
+
 Future<Void> sendAll(Reference<IConnection> conn, std::string data) {
 	UnsentPacketQueue packets;
 	PacketWriter writer(packets.getWriteBuffer(data.size()), nullptr, Unversioned());
@@ -137,7 +220,47 @@ Future<Void> exchange(Reference<IConnection> client, Reference<IConnection> serv
 	check(gotUp == up && gotDown == down, label + ": " + std::to_string(size) + " bytes each way intact");
 }
 
-Future<Void> runOne(bool useKtls, bool expectKernel, std::string mode) {
+// A plain-OpenSSL client with this process's chain must interoperate with a Net2 server (one side kernel TLS, the
+// other user space); one with a chain from a different root must be rejected by the server's peer verification.
+Future<Void> rawClientCheck(Creds trusted, Creds stranger, std::string label) {
+	for (bool trustedClient : { true, false }) {
+		Reference<IListener> listener = INetworkConnections::net()->listen(NetworkAddress::parse("127.0.0.1:0:tls"));
+		Future<Reference<IConnection>> accepted = listener->accept();
+		RawClient client;
+		client.start(listener->getListenAddress().port, trustedClient ? trusted : stranger, trusted.ca);
+		Reference<IConnection> server = co_await accepted;
+		bool handshook = false;
+		try {
+			co_await server->acceptHandshake();
+			handshook = true;
+		} catch (Error& e) {
+			if (e.code() != error_code_connection_failed) {
+				throw;
+			}
+		}
+		if (trustedClient) {
+			bool exchanged = false;
+			if (handshook && server->hasTrustedPeer()) {
+				const std::string ping = co_await receiveAll(server, 4);
+				co_await sendAll(server, "pong");
+				exchanged = ping == "ping";
+			}
+			while (!client.done) {
+				co_await delay(0.01);
+			}
+			check(exchanged && client.ok, label + ": plain OpenSSL client with a trusted chain interoperates");
+		} else {
+			check(!handshook, label + ": client with a chain from another root is rejected");
+		}
+		server->close();
+		while (!client.done) {
+			co_await delay(0.01);
+		}
+		client.thread.join();
+	}
+}
+
+Future<Void> runOne(bool useKtls, bool expectKernel, std::string mode, Creds trusted, Creds stranger) {
 	const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_USE_KTLS = useKtls;
 	const std::string label = mode + (useKtls ? " knob on" : " knob off");
 
@@ -188,16 +311,19 @@ Future<Void> runOne(bool useKtls, bool expectKernel, std::string mode) {
 	}
 	check(failed, label + ": peer close is reported as connection_failed");
 	server->close();
+
+	co_await rawClientCheck(trusted, stranger, label);
 }
 
-Future<Void> runAll(std::string mode, bool kernelCipher, int* rc) {
+Future<Void> runAll(std::string mode, bool kernelCipher, Creds trusted, int* rc) {
 	try {
-		co_await runOne(false, false, mode);
+		const Creds stranger = makeCreds();
+		co_await runOne(false, false, mode, trusted, stranger);
 		const bool expectKernel = kernelCipher && kernelTlsAvailable();
 		if (kernelCipher && !expectKernel) {
 			std::printf("NOTE kernel tls module not loaded: knob-on run checks the user-space fallback only\n");
 		}
-		co_await runOne(true, expectKernel, mode);
+		co_await runOne(true, expectKernel, mode, trusted, stranger);
 	} catch (Error& e) {
 		std::printf("FAIL %s: unexpected error %s\n", mode.c_str(), e.what());
 		++failures;
@@ -240,19 +366,16 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	auto arena = Arena();
-	auto chain = mkcert::makeCertChain(arena, mkcert::makeCertChainSpec(arena, 2, mkcert::ESide::Server), {});
-	auto nonRoot = chain;
-	nonRoot.pop_back();
+	const Creds creds = makeCreds();
 	TLSConfig tlsConfig(TLSEndpointType::SERVER);
-	tlsConfig.setCertificateBytes(concatCertChain(arena, nonRoot).toString());
-	tlsConfig.setKeyBytes(chain.front().privateKeyPem.toString());
-	tlsConfig.setCABytes(chain.back().certPem.toString());
+	tlsConfig.setCertificateBytes(creds.cert);
+	tlsConfig.setKeyBytes(creds.key);
+	tlsConfig.setCABytes(creds.ca);
 
 	g_network = newNet2(tlsConfig, false, false);
 	openTraceFile({}, 10 << 20, 10 << 20, ".", "ktls_unittest");
 	int rc = 1;
-	Future<Void> test = runAll(mode, kernelCipher, &rc);
+	Future<Void> test = runAll(mode, kernelCipher, creds, &rc);
 	g_network->run();
 	flushTraceFileVoid();
 	std::printf("%s\n", rc == 0 ? "ALL PASSED" : "SOME CHECKS FAILED");
