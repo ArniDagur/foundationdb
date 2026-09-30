@@ -601,64 +601,6 @@ public:
 		}
 	}
 
-	// Queues toStart[0..n) on the network thread's io_uring when KAIO_IO_URING is set; the run loop submits them.
-	// Returns n, or -1 when the ring is not in use.
-	static int submitToRing(IOBlock** toStart, int n) {
-		if (!FLOW_KNOBS->KAIO_IO_URING) {
-			return -1;
-		}
-		iouring::Ring* ring = iouring::Ring::get();
-		if (!ring) {
-			return -1;
-		}
-		for (int i = 0; i < n; i++) {
-			IOBlock* io = toStart[i];
-			io_uring_sqe* sqe = ring->sqe();
-			iouring::Kind kind;
-			switch (io->aio_lio_opcode) {
-			case IO_CMD_PREAD:
-				iouring::prepRead(sqe, io->aio_fildes, io->buf, io->nbytes, io->offset);
-				kind = iouring::Kind::DiskRead;
-				break;
-			case IO_CMD_PWRITE:
-				iouring::prepWrite(sqe, io->aio_fildes, io->buf, io->nbytes, io->offset);
-				kind = iouring::Kind::DiskWrite;
-				break;
-			case IO_CMD_FDSYNC:
-				iouring::prepFsync(sqe, io->aio_fildes, /*datasync=*/true);
-				kind = iouring::Kind::DiskFsync;
-				break;
-			default:
-				UNREACHABLE();
-			}
-			ring->queue(sqe, &io->uringOp, kind);
-			ctx.submittedIOCBs++;
-		}
-		ctx.submitCalls++;
-		ctx.largestSubmitBatch = std::max<int64_t>(ctx.largestSubmitBatch, n);
-		return n;
-	}
-
-	// The io_uring counterpart of one completion in poll().
-	static void ringCompleted(IOBlock* iob, int32_t res) {
-		--ctx.outstanding;
-		++ctx.ringCompletions;
-		if (ctx.ioTimeout > 0) {
-			ctx.removeFromRequestList(iob);
-		}
-		const double currentTime = timer();
-		switch (iob->aio_lio_opcode) {
-		case IO_CMD_PREAD:
-			getMetrics().readLatencySample.addMeasurement(currentTime - iob->startTime);
-			break;
-		case IO_CMD_PWRITE:
-			getMetrics().writeLatencySample.addMeasurement(currentTime - iob->startTime);
-			break;
-		}
-		KAIOLogBlockEvent(iob, OpLogEntry::COMPLETE, res);
-		iob->setResult(res);
-	}
-
 	static int64_t getRingCompletions() { return ctx.ringCompletions; }
 
 	struct SubmitStats {
@@ -786,6 +728,64 @@ private:
 				owner->failed = true;
 		}
 	};
+
+	// Queues toStart[0..n) on the network thread's io_uring when KAIO_IO_URING is set; the run loop submits them.
+	// Returns n, or -1 when the ring is not in use.
+	static int submitToRing(IOBlock** toStart, int n) {
+		if (!FLOW_KNOBS->KAIO_IO_URING) {
+			return -1;
+		}
+		iouring::Ring* ring = iouring::Ring::get();
+		if (!ring) {
+			return -1;
+		}
+		for (int i = 0; i < n; i++) {
+			IOBlock* io = toStart[i];
+			io_uring_sqe* sqe = ring->sqe();
+			iouring::Kind kind;
+			switch (io->aio_lio_opcode) {
+			case IO_CMD_PREAD:
+				iouring::prepRead(sqe, io->aio_fildes, io->buf, io->nbytes, io->offset);
+				kind = iouring::Kind::DiskRead;
+				break;
+			case IO_CMD_PWRITE:
+				iouring::prepWrite(sqe, io->aio_fildes, io->buf, io->nbytes, io->offset);
+				kind = iouring::Kind::DiskWrite;
+				break;
+			case IO_CMD_FDSYNC:
+				iouring::prepFsync(sqe, io->aio_fildes, /*datasync=*/true);
+				kind = iouring::Kind::DiskFsync;
+				break;
+			default:
+				UNREACHABLE();
+			}
+			ring->queue(sqe, &io->uringOp, kind);
+			ctx.submittedIOCBs++;
+		}
+		ctx.submitCalls++;
+		ctx.largestSubmitBatch = std::max<int64_t>(ctx.largestSubmitBatch, n);
+		return n;
+	}
+
+	// The io_uring counterpart of one completion in poll().
+	static void ringCompleted(IOBlock* iob, int32_t res) {
+		--ctx.outstanding;
+		++ctx.ringCompletions;
+		if (ctx.ioTimeout > 0) {
+			ctx.removeFromRequestList(iob);
+		}
+		const double currentTime = timer();
+		switch (iob->aio_lio_opcode) {
+		case IO_CMD_PREAD:
+			getMetrics().readLatencySample.addMeasurement(currentTime - iob->startTime);
+			break;
+		case IO_CMD_PWRITE:
+			getMetrics().writeLatencySample.addMeasurement(currentTime - iob->startTime);
+			break;
+		}
+		KAIOLogBlockEvent(iob, OpLogEntry::COMPLETE, res);
+		iob->setResult(res);
+	}
 
 	// A minimal io_uring used only for fsyncs (KAIO_FDSYNC=2), driven with raw syscalls. Its completions are
 	// signalled on the KAIO eventfd so the existing poll() loop reaps them.

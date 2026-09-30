@@ -29,7 +29,7 @@
 #include <cstdint>
 
 struct io_uring_sqe;
-struct msghdr;
+struct io_uring_cqe;
 
 namespace iouring {
 
@@ -113,7 +113,7 @@ private:
 	unsigned* cqHead = nullptr;
 	unsigned* cqTail = nullptr;
 	unsigned* cqMask = nullptr;
-	struct io_uring_cqe* cqes = nullptr;
+	::io_uring_cqe* cqes = nullptr;
 	unsigned localTail = 0;
 	unsigned unsubmitted = 0;
 	bool reaping = false;
