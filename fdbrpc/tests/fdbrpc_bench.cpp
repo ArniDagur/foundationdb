@@ -18,10 +18,16 @@
  * limitations under the License.
  */
 
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <boost/program_options.hpp>
+#include <sys/resource.h>
 
 #include "flow/flow.h"
+#include "flow/IoUring.h"
+#include "flow/Knobs.h"
+#include "flow/MkCert.h"
 #include "flow/Platform.h"
 #include "flow/TLSConfig.h"
 #include "fdbrpc/fdbrpc.h"
@@ -30,6 +36,41 @@
 namespace fdbrpc_bench {
 NetworkAddress serverAddress;
 TaskPriority echoEndpointPriority = TaskPriority::DefaultEndpoint;
+int reportSeconds = 10;
+int reportCount = 0; // 0: report forever
+
+// This process's CPU seconds (all threads, user and system).
+double processCpuSeconds() {
+	rusage u;
+	getrusage(RUSAGE_SELF, &u);
+	return u.ru_utime.tv_sec + u.ru_utime.tv_usec * 1e-6 + u.ru_stime.tv_sec + u.ru_stime.tv_usec * 1e-6;
+}
+
+// Prints requests per second, process CPU cores and CPU microseconds per request every reportSeconds, and stops the
+// network after reportCount reports when set.
+Future<Void> reportLoop(const char* role, const int64_t* requests) {
+	int64_t lastRequests = *requests;
+	double lastCpu = processCpuSeconds();
+	double lastTime = timer_monotonic();
+	for (int n = 1; reportCount == 0 || n <= reportCount; n++) {
+		co_await delay(reportSeconds);
+		const double now = timer_monotonic(), cpu = processCpuSeconds();
+		const int64_t done = *requests - lastRequests;
+		iouring::Ring* ring = iouring::Ring::existing();
+		std::cout << format("%s report %d: %.0f req/s, %.3f cores, %.2f cpu_us/req, io_uring enters %lld\n",
+		                    role,
+		                    n,
+		                    done / (now - lastTime),
+		                    (cpu - lastCpu) / (now - lastTime),
+		                    done > 0 ? (cpu - lastCpu) * 1e6 / done : 0.0,
+		                    ring ? (long long)ring->stats().enters : 0LL)
+		          << std::flush;
+		lastRequests = *requests;
+		lastCpu = cpu;
+		lastTime = now;
+	}
+	g_network->stop();
+}
 
 constexpr int MAX_CLIENT_CONCURRENCY = 4096;
 
@@ -137,17 +178,7 @@ class EchoServer {
 				EchoRequest req = co_await interf.echo.getFuture();
 				req.reply.send(req.message);
 				counter.inc();
-			} catch (Error& e) {
-				rethrowUnexpectedError(e);
-			}
-		}
-	}
-
-	Future<Void> printThroughput() {
-		while (true) {
-			try {
-				co_await delay(10);
-				std::cout << "Throughput: " << counter.avg() << " req/sec" << std::endl;
+				++served;
 			} catch (Error& e) {
 				rethrowUnexpectedError(e);
 			}
@@ -158,12 +189,14 @@ class EchoServer {
 	StatCounter counter;
 
 public:
+	int64_t served = 0;
+
 	EchoServer() {
 		interf.getInterface.makeWellKnownEndpoint(WLTOKEN_ECHO_SERVER, TaskPriority::DefaultEndpoint);
 		interf.echo.getEndpoint(echoEndpointPriority);
 	}
 
-	Future<Void> run() { co_await race(serveGetInterfaceReqs(), serveEchoReqs(), printThroughput()); }
+	Future<Void> run() { co_await race(serveGetInterfaceReqs(), serveEchoReqs(), reportLoop("server", &served)); }
 };
 
 Future<Void> echoServer() {
@@ -188,31 +221,32 @@ std::string randString(int size) {
 	return result;
 }
 
+int64_t clientRequests = 0;
+
+Future<Void> echoClientActor(EchoServerInterface server, std::string payload) {
+	while (true) {
+		EchoRequest echoRequest;
+		echoRequest.message = payload;
+		co_await server.echo.getReply(echoRequest);
+		++clientRequests;
+	}
+}
+
+int clientConcurrency = 1;
+
 Future<Void> echoClient() {
-	std::cout << "Starting client. Payload size: " << payload_size_bytes << " bytes" << std::endl;
+	std::cout << "Starting client. Payload size: " << payload_size_bytes << " bytes, concurrency " << clientConcurrency
+	          << std::endl;
 	EchoServerInterface server;
 	server.getInterface =
 	    RequestStream<GetInterfaceRequest>(Endpoint::wellKnown({ serverAddress }, WLTOKEN_ECHO_SERVER));
 	server = co_await server.getInterface.getReply(GetInterfaceRequest());
-	std::string payload = randString(payload_size_bytes);
-
-	while (true) {
-		int duration_seconds = 10;
-		int request_count = 0;
-
-		std::chrono::time_point<std::chrono::steady_clock> start_time = std::chrono::steady_clock::now();
-		std::chrono::time_point<std::chrono::steady_clock> end_time =
-		    start_time + std::chrono::seconds(duration_seconds);
-
-		while (std::chrono::steady_clock::now() < end_time) {
-			EchoRequest echoRequest;
-			echoRequest.message = payload;
-			co_await server.echo.getReply(echoRequest);
-			++request_count;
-		}
-		std::cout << "Sent " << request_count << " requests in " << request_count / duration_seconds << " /second"
-		          << std::endl;
+	const std::string payload = randString(payload_size_bytes);
+	std::vector<Future<Void>> actors;
+	for (int i = 0; i < clientConcurrency; i++) {
+		actors.push_back(echoClientActor(server, payload));
 	}
+	co_await race(waitForAll(actors), reportLoop("client", &clientRequests));
 }
 
 std::unordered_map<std::string, std::function<Future<Void>()>> actors = {
@@ -232,7 +266,12 @@ int main(int argc, char* argv[]) {
 		("mode,m", po::value<std::string>(), "process mode [server/client]")
 		("payload_size,s", po::value<int>(), "size of payload sent by client (bytes)")
 		("endpoint_priority", po::value<std::string>()->default_value("default"), "server echo endpoint priority [default/loadbalanced]")
-		("concurrency,c", po::value<int>()->default_value(1), "number of client actors [1/4096]");
+		("concurrency,c", po::value<int>()->default_value(1), "number of client actors [1/4096]")
+	("tls_dir", po::value<std::string>(), "use TLS; the server writes a generated certificate chain to this directory and the client reads it")
+	("ktls", "kernel TLS for TLS connections (FLOW_KNOBS->TLS_USE_KTLS)")
+	("net_io_uring", "socket I/O through io_uring (FLOW_KNOBS->NET_IO_URING)")
+	("report_seconds", po::value<int>()->default_value(10), "seconds between reports")
+	("reports", po::value<int>()->default_value(0), "stop after this many reports (0: never)");
 	// clang-format on
 
 	po::variables_map vm;
@@ -272,14 +311,46 @@ int main(int argc, char* argv[]) {
 	bool isServer = (mode == "server");
 	std::vector<std::function<Future<Void>()>> toRun;
 	auto actor = actors.find(mode);
-	toRun.resize(isServer ? 1 : concurrency, actor->second);
+	toRun.resize(1, actor->second);
+	clientConcurrency = concurrency;
+	reportSeconds = vm["report_seconds"].as<int>();
+	reportCount = vm["reports"].as<int>();
+	if (vm.count("ktls")) {
+		const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_USE_KTLS = true;
+	}
+	if (vm.count("net_io_uring")) {
+		const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING = true;
+	}
 
 	platformInit();
-	g_network = newNet2(TLSConfig(), false, true);
+	TLSConfig tlsConfig(isServer ? TLSEndpointType::SERVER : TLSEndpointType::CLIENT);
+	const bool tls = vm.count("tls_dir") > 0;
+	if (tls) {
+		const std::string dir = vm["tls_dir"].as<std::string>();
+		auto readFile = [](const std::string& path) {
+			std::ifstream f(path);
+			std::stringstream ss;
+			ss << f.rdbuf();
+			return ss.str();
+		};
+		if (isServer) {
+			Arena arena;
+			auto chain = mkcert::makeCertChain(arena, mkcert::makeCertChainSpec(arena, 2, mkcert::ESide::Server), {});
+			auto nonRoot = chain;
+			nonRoot.pop_back();
+			std::ofstream(dir + "/cert.pem") << concatCertChain(arena, nonRoot).toString();
+			std::ofstream(dir + "/key.pem") << chain.front().privateKeyPem.toString();
+			std::ofstream(dir + "/ca.pem") << chain.back().certPem.toString();
+		}
+		tlsConfig.setCertificateBytes(readFile(dir + "/cert.pem"));
+		tlsConfig.setKeyBytes(readFile(dir + "/key.pem"));
+		tlsConfig.setCABytes(readFile(dir + "/ca.pem"));
+	}
+	g_network = newNet2(tlsConfig, false, true);
 	FlowTransport::createInstance(!isServer, 0, WLTOKEN_COUNT_ENDPOINTS);
 
-	serverAddress = NetworkAddress::parse("127.0.0.1:9001");
-	NetworkAddress publicAddress = NetworkAddress::parse("127.0.0.1:9001");
+	serverAddress = NetworkAddress::parse(tls ? "127.0.0.1:9001:tls" : "127.0.0.1:9001");
+	NetworkAddress publicAddress = serverAddress;
 
 	try {
 		if (isServer) {
