@@ -441,6 +441,14 @@ void Ring::InternalOp::complete(int32_t, uint32_t) {
 	fired = true;
 }
 
+void Ring::cancel(Op* op, Kind kind) {
+	io_uring_sqe* s = sqe();
+	s->opcode = IORING_OP_ASYNC_CANCEL;
+	s->fd = -1;
+	s->addr = reinterpret_cast<uintptr_t>(op) | uint64_t(kind);
+	queue(s, &cancelOp, Kind::Internal);
+}
+
 void Ring::wake() {
 	const uint64_t one = 1;
 	[[maybe_unused]] ssize_t n = ::write(wakeFd, &one, sizeof(one));
@@ -477,6 +485,7 @@ void Ring::maybeLogMetrics(double now, double intervalSeconds) {
 		ev.detail(std::string("Completed") + kindName(k), counters.completed[k] - lastLogged.completed[k]);
 	}
 	ev.detail("RecvNoBuffers", counters.recvNoBuffers - lastLogged.recvNoBuffers);
+	ev.detail("RecvPaused", counters.recvPaused - lastLogged.recvPaused);
 	ev.detail("Queued", unsubmitted);
 	lastLogged = counters;
 }

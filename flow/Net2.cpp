@@ -492,6 +492,10 @@ public:
 					rxChunks.pop_front();
 				}
 			}
+			if (rxPaused && rxChunks.empty() && !rxPending) {
+				rxPaused = false;
+				armReceive();
+			}
 		} else if (rxEnd > rxBegin) {
 			copied = std::min<size_t>(rxEnd - rxBegin, room);
 			memcpy(begin, rxBuf.data() + rxBegin, copied);
@@ -604,7 +608,8 @@ private:
 	bool hasReceived() const { return multishot ? !rxChunks.empty() : rxEnd > rxBegin; }
 
 	void armReceive() {
-		if (rxPending || rxDone || rxControl || closed || waitingForBuffers || (!multishot && rxEnd > rxBegin)) {
+		if (rxPending || rxDone || rxControl || closed || waitingForBuffers || rxPaused ||
+		    (!multishot && rxEnd > rxBegin)) {
 			return;
 		}
 		rxPending = true;
@@ -639,26 +644,43 @@ private:
 				} else {
 					rxChunks.push_back(RxChunk{ bid, uint32_t(res), 0 });
 				}
-				if (!more) {
+				if (more && !rxPaused && rxChunks.size() * ring->bufferSize() >= size_t(maxQueuedBytes)) {
+					// The reader is behind: stop taking shared buffers, so this connection's sender sees TCP flow
+					// control as it would without io_uring. read() resumes once the backlog is drained.
+					rxPaused = true;
+					ring->noteRecvPaused();
+					ring->cancel(&recvOp, iouring::Kind::NetRecv);
+				} else if (!more) {
 					armReceive(); // the kernel ended the multishot receive (a full completion queue, say)
 				}
 			} else {
 				rxBegin = 0;
 				rxEnd = res;
 			}
-		} else if (res == -ENOBUFS && multishot) {
-			// Every provided buffer holds data not yet read; re-arm once one comes back.
-			ring->noteRecvNoBuffers();
-			if (!closed) {
-				waitingForBuffers = ring->waitForBuffers(this);
-				armReceive();
-			}
-			return;
-		} else if (res == -EIO && kernelTls && !closed) {
-			rxControl = true;
 		} else {
-			rxDone = true;
-			rxErrno = res == 0 ? 0 : -res;
+			if (multishot && (flags & iouring::kCqeBuffer)) {
+				ring->recycleBuffer(iouring::cqeBufferId(flags)); // no data in it
+			}
+			if (res == -ENOBUFS && multishot) {
+				// Every provided buffer holds data not yet read; re-arm once one comes back.
+				ring->noteRecvNoBuffers();
+				if (!closed) {
+					waitingForBuffers = ring->waitForBuffers(this);
+					armReceive();
+				}
+				return;
+			} else if (res == -ECANCELED && rxPaused) {
+				if (rxChunks.empty()) {
+					rxPaused = false; // read() drained the backlog before the cancellation landed
+					armReceive();
+				}
+				return;
+			} else if (res == -EIO && kernelTls && !closed) {
+				rxControl = true;
+			} else {
+				rxDone = true;
+				rxErrno = res == 0 ? 0 : -res;
+			}
 		}
 		Promise<Void> ready = std::move(rxReady);
 		rxReady = Promise<Void>();
@@ -713,7 +735,8 @@ private:
 	std::deque<RxChunk> rxChunks; // multishot: received data in provided buffers, oldest first
 	std::vector<uint8_t> rxBuf; // otherwise
 	size_t rxBegin = 0, rxEnd = 0;
-	bool rxPending = false, rxDone = false, rxControl = false, waitingForBuffers = false;
+	bool rxPending = false, rxDone = false, rxControl = false, waitingForBuffers = false, rxPaused = false;
+	const int maxQueuedBytes = FLOW_KNOBS->NET_IO_URING_MAX_QUEUED_BYTES;
 	int rxErrno = 0;
 	Promise<Void> rxReady;
 	RecvOp recvOp;

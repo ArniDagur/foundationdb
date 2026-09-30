@@ -31,7 +31,8 @@
 // handles in both directions must move their data through the network thread's io_uring (its receive and send
 // completion counters grow) and leave Asio's epoll set, and every other TLS connection must not touch the ring. Where
 // the kernel provides buffer rings (6.1+ here), receives must be multishot (more completions than submissions) unless
-// --no-multishot; --recv-buffers=N shrinks the shared buffer pool so that receives run out of buffers and resume.
+// --no-multishot, and a connection with too much unread data must pause its receive (so its sender still stalls);
+// --recv-buffers=N shrinks the shared buffer pool so that receives run out of buffers and resume.
 //
 //   ktls_unittest [--net-io-uring [--no-multishot] [--recv-buffers=N]] [--main-thread-handshakes]
 //                 [--openssl-conf=tls12|cbc]
@@ -486,12 +487,19 @@ Future<Void> runAll(std::string mode, bool kernelCipher, Creds trusted, int* rc)
 		}
 		co_await runOne(true, true, expectKernel, ring && expectKernel, mode, trusted, stranger);
 		if (iouring::Ring* r = iouring::Ring::existing()) {
-			std::printf("NOTE io_uring: %s receive buffers, %lld times out of buffers\n",
-			            r->hasBufferRing() ? std::to_string(FLOW_KNOBS->NET_IO_URING_RECV_BUFFERS).c_str()
-			                               : "no shared",
-			            (long long)r->stats().recvNoBuffers);
+			const std::string buffers =
+			    r->hasBufferRing() ? std::to_string(FLOW_KNOBS->NET_IO_URING_RECV_BUFFERS) : std::string("no shared");
+			std::printf(
+			    "NOTE io_uring: %s receive buffers, %lld times out of buffers, %lld pauses of a connection with "
+			    "too much unread data\n",
+			    buffers.c_str(),
+			    (long long)r->stats().recvNoBuffers,
+			    (long long)r->stats().recvPaused);
 			if (r->hasBufferRing() && FLOW_KNOBS->NET_IO_URING_RECV_BUFFERS <= 4) {
 				check(r->stats().recvNoBuffers > 0, mode + ": receives ran out of buffers and resumed");
+			} else if (r->hasBufferRing()) {
+				// The backpressure checks leave megabytes unread on one connection.
+				check(r->stats().recvPaused > 0, mode + ": a connection's multishot receive paused and resumed");
 			}
 		}
 	} catch (Error& e) {

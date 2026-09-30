@@ -53,6 +53,7 @@ struct Stats {
 	int64_t enters = 0; // io_uring_enter calls
 	int64_t waits = 0; // io_uring_enter calls that waited for a completion
 	int64_t recvNoBuffers = 0; // multishot receives stopped because the provided buffer ring was empty
+	int64_t recvPaused = 0; // multishot receives cancelled because their connection held too much unread data
 };
 
 // Notified when provided receive buffers are returned to an empty buffer ring.
@@ -98,12 +99,18 @@ public:
 	// completion flags name the buffer. Every buffer handed out must come back through recycleBuffer().
 	bool hasBufferRing() const { return bufRing != nullptr; }
 	uint8_t* bufferData(uint16_t bid) const { return bufMem + size_t(bid) * bufSize; }
+	unsigned bufferSize() const { return bufSize; }
 	void recycleBuffer(uint16_t bid);
 	// For a receive that ran out of buffers: false when some have come back since (the caller may re-arm at once);
 	// otherwise calls waiter->buffersAvailable() once, after the next recycleBuffer(), unless cancelled first.
 	bool waitForBuffers(BufferWaiter* waiter);
 	void cancelBufferWait(BufferWaiter* waiter);
 	void noteRecvNoBuffers() { ++counters.recvNoBuffers; }
+	void noteRecvPaused() { ++counters.recvPaused; }
+
+	// Asks the kernel to cancel op's in-flight operation (queued as kind); op then completes with -ECANCELED unless it
+	// finished first. The cancellation's own completion is discarded.
+	void cancel(Op* op, Kind kind);
 
 	unsigned queued() const { return unsubmitted; }
 	int descriptor() const { return fd; }
@@ -152,6 +159,7 @@ private:
 	InternalOp wakeOp;
 	int epollFd = -1;
 	InternalOp epollOp;
+	InternalOp cancelOp;
 
 	struct BufRingEntry; // struct io_uring_buf
 	BufRingEntry* bufRing = nullptr;
