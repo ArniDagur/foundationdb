@@ -67,6 +67,9 @@
 #endif
 constexpr unsigned kRegisterPbufRing = 22; // IORING_REGISTER_PBUF_RING (5.19)
 constexpr uint16_t kRecvMultishot = 1U << 1; // IORING_RECV_MULTISHOT (6.0)
+constexpr uint16_t kAcceptMultishot = 1U << 0; // IORING_ACCEPT_MULTISHOT (5.19)
+constexpr uint32_t kCancelAll = 1U << 0; // IORING_ASYNC_CANCEL_ALL (5.19)
+constexpr uint32_t kCancelFd = 1U << 1; // IORING_ASYNC_CANCEL_FD (5.19)
 constexpr uint16_t kBufferGroup = 0;
 
 namespace iouring {
@@ -79,7 +82,8 @@ constexpr uint64_t kKindMask = 7; // Op objects are at least 8-byte aligned; the
 static_assert(int(Kind::Count) <= int(kKindMask) + 1);
 
 const char* kindName(int k) {
-	static const char* names[] = { "NetRecv", "NetSend", "DiskRead", "DiskWrite", "DiskFsync", "Internal" };
+	static const char* names[] = { "NetRecv", "NetSend", "NetSetup", "DiskRead", "DiskWrite", "DiskFsync", "Internal" };
+	static_assert(sizeof(names) / sizeof(names[0]) == size_t(Kind::Count));
 	return names[k];
 }
 } // namespace
@@ -449,6 +453,17 @@ void Ring::cancel(Op* op, Kind kind) {
 	queue(s, &cancelOp, Kind::Internal);
 }
 
+void Ring::cancelFd(int fd) {
+	if (!modern()) {
+		return;
+	}
+	io_uring_sqe* s = sqe();
+	s->opcode = IORING_OP_ASYNC_CANCEL;
+	s->fd = fd;
+	s->rw_flags = kCancelFd | kCancelAll; // the cancel_flags member of the same union
+	queue(s, &cancelOp, Kind::Internal);
+}
+
 void Ring::wake() {
 	const uint64_t one = 1;
 	[[maybe_unused]] ssize_t n = ::write(wakeFd, &one, sizeof(one));
@@ -504,6 +519,26 @@ void prepRecvMultishot(io_uring_sqe* s, int fd) {
 	s->flags = IOSQE_BUFFER_SELECT;
 	s->buf_group = kBufferGroup;
 	s->ioprio = kRecvMultishot;
+}
+
+void prepPoll(io_uring_sqe* s, int fd, unsigned events) {
+	s->opcode = IORING_OP_POLL_ADD;
+	s->fd = fd;
+	s->poll32_events = events;
+}
+
+void prepAccept(io_uring_sqe* s, int fd, bool multishot) {
+	s->opcode = IORING_OP_ACCEPT;
+	s->fd = fd;
+	s->accept_flags = SOCK_CLOEXEC;
+	s->ioprio = multishot ? kAcceptMultishot : 0;
+}
+
+void prepConnect(io_uring_sqe* s, int fd, const void* addr, unsigned addrLen) {
+	s->opcode = IORING_OP_CONNECT;
+	s->fd = fd;
+	s->addr = reinterpret_cast<uintptr_t>(addr);
+	s->off = addrLen;
 }
 
 void prepSendmsg(io_uring_sqe* s, int fd, const msghdr* msg, int flags) {

@@ -19,20 +19,22 @@
  */
 
 // Loopback TLS connections through Net2, with FLOW_KNOBS->TLS_USE_KTLS off and on. Payloads of many sizes, sent as
-// multi-buffer packet chains in both directions at once, must arrive intact. With the knob on and the kernel tls
-// module available, both ends must have the kernel TLS upper-layer protocol with send and receive keys installed;
-// with a cipher the kernel cannot handle (--openssl-conf=cbc) the connection must fall back to user-space TLS. A
-// plain-OpenSSL client must interoperate with the Net2 server, and peer verification must still reject a client whose
-// chain has a different root. A handshake write to a connection shut down for writing, and data writes to a connection
-// the peer reset, must fail cleanly, not raise SIGPIPE.
+// multi-buffer packet chains in both directions at once, must arrive intact. With the knob on kernel TLS is mandatory:
+// both ends must have the kernel TLS upper-layer protocol with send and receive keys installed (even when the process's
+// OpenSSL defaults prefer a cipher the kernel cannot take, --openssl-conf=cbc), a plain-OpenSSL peer that offers only
+// such a cipher must be refused, and without the kernel tls module every handshake must fail. A plain-OpenSSL client
+// with a kernel-capable cipher must interoperate with the Net2 server, and peer verification must still reject a client
+// whose chain has a different root. A handshake write to a connection shut down for writing, and data writes to a
+// connection the peer reset, must fail cleanly, not raise SIGPIPE.
 // Plain TCP connections get the same data checks, plus a sender that fills the socket while the receiver waits.
 //
-// With --net-io-uring (FLOW_KNOBS->NET_IO_URING), plain TCP connections and TLS connections whose records the kernel
-// handles in both directions must move their data through the network thread's io_uring (its receive and send
-// completion counters grow) and leave Asio's epoll set, and every other TLS connection must not touch the ring. Where
-// the kernel provides buffer rings (6.1+ here), receives must be multishot (more completions than submissions) unless
-// --no-multishot, and a connection with too much unread data must pause its receive (so its sender still stalls);
-// --recv-buffers=N shrinks the shared buffer pool so that receives run out of buffers and resume.
+// With --net-io-uring (FLOW_KNOBS->NET_IO_URING), plain TCP connections and kernel TLS connections must be accepted,
+// connected (and, for TLS, shake hands on the network thread) and move their data through the network thread's
+// io_uring (its setup, receive and send completion counters grow), with no socket of the process in any epoll set, and
+// user-space TLS connections (knob off) must not touch the ring. Where the kernel provides buffer rings (6.1+ here),
+// receives must be multishot (more completions than submissions) unless --no-multishot, and a connection with too much
+// unread data must pause its receive (so its sender still stalls); --recv-buffers=N shrinks the shared buffer pool so
+// that receives run out of buffers and resume.
 //
 //   ktls_unittest [--net-io-uring [--no-multishot] [--recv-buffers=N]] [--main-thread-handshakes]
 //                 [--openssl-conf=tls12|cbc]
@@ -66,6 +68,7 @@
 #include "flow/TLSConfig.h"
 #include "flow/network.h"
 #include "flow/serialize.h"
+#include "flow/SimpleCounter.h"
 
 namespace {
 
@@ -226,6 +229,45 @@ int64_t ringCount(bool submitted, iouring::Kind kind) {
 	return (submitted ? ring->stats().submitted : ring->stats().completed)[int(kind)];
 }
 
+bool inAnyEpollSet(int fd);
+
+int64_t counterValue(const std::string& name) {
+	int64_t v = 0;
+	for (auto* c : SimpleCounter<int64_t>::getCounters()) {
+		if (c->name() == name) {
+			v += c->get();
+		}
+	}
+	return v;
+}
+
+int64_t sideThreadHandshakes() {
+	return counterValue("/Net2/TLS/ServerTLSHandshakesOnSideThreads") +
+	       counterValue("/Net2/TLS/ClientTLSHandshakesOnSideThreads");
+}
+
+// Descriptors of this process's sockets that some epoll instance of this process watches.
+std::vector<int> socketsInEpollSets() {
+	std::vector<int> sockets, watched;
+	DIR* dir = opendir("/proc/self/fd");
+	while (dirent* e = dir ? readdir(dir) : nullptr) {
+		char target[64] = {};
+		const std::string link = std::string("/proc/self/fd/") + e->d_name;
+		if (readlink(link.c_str(), target, sizeof(target) - 1) > 0 && std::strncmp(target, "socket:", 7) == 0) {
+			sockets.push_back(std::atoi(e->d_name));
+		}
+	}
+	if (dir) {
+		closedir(dir);
+	}
+	for (int fd : sockets) {
+		if (inAnyEpollSet(fd)) {
+			watched.push_back(fd);
+		}
+	}
+	return watched;
+}
+
 // Whether any epoll instance of this process watches fd (from the tfd lines of /proc/self/fdinfo).
 bool inAnyEpollSet(int fd) {
 	bool found = false;
@@ -301,8 +343,9 @@ Future<Void> exchange(Reference<IConnection> client, Reference<IConnection> serv
 }
 
 // A plain-OpenSSL client with this process's chain must interoperate with a Net2 server (one side kernel TLS, the
-// other user space); one with a chain from a different root must be rejected by the server's peer verification.
-Future<Void> rawClientCheck(Creds trusted, Creds stranger, std::string label) {
+// other user space); one with a chain from a different root must be rejected by the server's peer verification. A
+// client that can only offer ciphers the server will not accept (kernel TLS mandatory) must be refused either way.
+Future<Void> rawClientCheck(Creds trusted, Creds stranger, std::string label, bool clientCanNegotiate) {
 	for (bool trustedClient : { true, false }) {
 		Reference<IListener> listener = INetworkConnections::net()->listen(NetworkAddress::parse("127.0.0.1:0:tls"));
 		Future<Reference<IConnection>> accepted = listener->accept();
@@ -318,7 +361,11 @@ Future<Void> rawClientCheck(Creds trusted, Creds stranger, std::string label) {
 				throw;
 			}
 		}
-		if (trustedClient) {
+		if (!clientCanNegotiate) {
+			check(!handshook,
+			      label + ": plain OpenSSL client offering only a cipher the kernel cannot take is refused" +
+			          (trustedClient ? "" : " (other root)"));
+		} else if (trustedClient) {
 			bool exchanged = false;
 			if (handshook && server->hasTrustedPeer()) {
 				const std::string ping = co_await receiveAll(server, 4);
@@ -383,22 +430,44 @@ Future<Void> sigpipeCheck(std::string label, bool tls = true) {
 	}
 }
 
-// One connection's checks. tls = false: a plain TCP connection. The ring must carry its data exactly when
-// expectRing.
-Future<Void>
-runOne(bool tls, bool useKtls, bool expectKernel, bool expectRing, std::string mode, Creds trusted, Creds stranger) {
+// One connection's checks. tls = false: a plain TCP connection. useKtls: kernel TLS is mandatory, so the handshake
+// must fail unless kernelTls (the kernel tls module works here). The ring must carry the connection's setup and data
+// exactly when expectRing. rawCipherOk: a plain OpenSSL client with this process's OpenSSL defaults offers a cipher
+// the kernel can take.
+Future<Void> runOne(bool tls,
+                    bool useKtls,
+                    bool kernelTls,
+                    bool expectRing,
+                    bool rawCipherOk,
+                    std::string mode,
+                    Creds trusted,
+                    Creds stranger) {
 	const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_USE_KTLS = useKtls;
 	const std::string label =
 	    tls ? mode + (useKtls ? " knob on" : " knob off") : (FLOW_KNOBS->NET_IO_URING ? "tcp io_uring" : "tcp");
 	const int64_t ringBefore = ringSocketCompletions();
 	const int64_t recvSubmittedBefore = ringCount(true, iouring::Kind::NetRecv);
 	const int64_t recvCompletedBefore = ringCount(false, iouring::Kind::NetRecv);
+	const int64_t setupBefore = ringCount(false, iouring::Kind::NetSetup);
+	const int64_t sideHandshakesBefore = sideThreadHandshakes();
 
 	Reference<IListener> listener =
 	    INetworkConnections::net()->listen(NetworkAddress::parse(tls ? "127.0.0.1:0:tls" : "127.0.0.1:0"));
 	Future<Reference<IConnection>> accepted = listener->accept();
 	Reference<IConnection> client = co_await INetworkConnections::net()->connect(listener->getListenAddress());
 	Reference<IConnection> server = co_await accepted;
+	if (tls && useKtls && !kernelTls) {
+		bool failed = false;
+		try {
+			co_await (client->connectHandshake() && server->acceptHandshake());
+		} catch (Error& e) {
+			failed = e.code() == error_code_connection_failed;
+		}
+		check(failed, label + ": without kernel TLS the handshake fails (no user-space fallback)");
+		client->close();
+		server->close();
+		co_return;
+	}
 	co_await (client->connectHandshake() && server->acceptHandshake());
 
 	const KernelTlsState c = kernelTlsState(client);
@@ -407,16 +476,23 @@ runOne(bool tls, bool useKtls, bool expectKernel, bool expectRing, std::string m
 		check(c.ulp.empty() && s.ulp.empty(), label + ": no TLS layer on either end");
 	} else if (!useKtls) {
 		check(c.ulp.empty() && s.ulp.empty(), label + ": no kernel TLS on either end");
-	} else if (expectKernel) {
+	} else {
 		check(c.ulp == "tls" && s.ulp == "tls", label + ": kernel TLS protocol on both ends");
 		check(c.tx && c.rx && s.tx && s.rx, label + ": kernel send and receive keys on both ends");
-	} else {
-		check(!c.tx && !c.rx && !s.tx && !s.rx, label + ": user-space TLS when the kernel cannot take the cipher");
 	}
 	if (expectRing) {
-		check(!inAnyEpollSet(client->getSocket().native_handle()) &&
-		          !inAnyEpollSet(server->getSocket().native_handle()),
-		      label + ": neither socket is in an epoll set");
+		const std::vector<int> watched = socketsInEpollSets();
+		check(watched.empty(),
+		      label + ": no socket of the process (listener, client, server) is in an epoll set (" +
+		          std::to_string(watched.size()) + " are)");
+		const int64_t setups = ringCount(false, iouring::Kind::NetSetup) - setupBefore;
+		check(setups >= 2,
+		      label + ": accept and connect" + (tls ? std::string(" and handshake waits") : std::string()) +
+		          " went through io_uring (" + std::to_string(setups) + " setup completions)");
+		if (tls) {
+			check(sideThreadHandshakes() == sideHandshakesBefore,
+			      label + ": handshakes ran on the network thread, not the handshake thread pool");
+		}
 	}
 
 	for (int size : { 1, 100, 4000, 16383, 16384, 16385, 65537, 1 << 20, 3 << 20 }) {
@@ -452,7 +528,7 @@ runOne(bool tls, bool useKtls, bool expectKernel, bool expectRing, std::string m
 	server->close();
 
 	if (tls) {
-		co_await rawClientCheck(trusted, stranger, label);
+		co_await rawClientCheck(trusted, stranger, label, !useKtls || rawCipherOk);
 	}
 	co_await sigpipeCheck(label, tls);
 
@@ -479,13 +555,13 @@ Future<Void> runAll(std::string mode, bool kernelCipher, Creds trusted, int* rc)
 	try {
 		const Creds stranger = makeCreds();
 		const bool ring = FLOW_KNOBS->NET_IO_URING;
-		co_await runOne(false, false, false, ring, mode, trusted, stranger);
-		co_await runOne(true, false, false, false, mode, trusted, stranger);
-		const bool expectKernel = kernelCipher && kernelTlsAvailable();
-		if (kernelCipher && !expectKernel) {
-			std::printf("NOTE kernel tls module not loaded: knob-on run checks the user-space fallback only\n");
+		co_await runOne(false, false, false, ring, true, mode, trusted, stranger);
+		co_await runOne(true, false, false, false, true, mode, trusted, stranger);
+		const bool kernelTls = kernelTlsAvailable();
+		if (!kernelTls) {
+			std::printf("NOTE kernel tls module not available: knob-on run checks that handshakes fail\n");
 		}
-		co_await runOne(true, true, expectKernel, ring && expectKernel, mode, trusted, stranger);
+		co_await runOne(true, true, kernelTls, ring && kernelTls, kernelCipher, mode, trusted, stranger);
 		if (iouring::Ring* r = iouring::Ring::existing()) {
 			const std::string buffers =
 			    r->hasBufferRing() ? std::to_string(FLOW_KNOBS->NET_IO_URING_RECV_BUFFERS) : std::string("no shared");

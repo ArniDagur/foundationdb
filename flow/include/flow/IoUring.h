@@ -35,7 +35,8 @@ struct msghdr;
 
 namespace iouring {
 
-enum class Kind : int { NetRecv, NetSend, DiskRead, DiskWrite, DiskFsync, Internal, Count };
+// NetSetup: accepts, connects and the readiness polls of TLS handshakes. Kinds live in the low 3 bits of user_data.
+enum class Kind : int { NetRecv, NetSend, NetSetup, DiskRead, DiskWrite, DiskFsync, Internal, Count };
 
 // An operation in flight on the ring. complete() runs on the network thread when its completion is reaped, with the
 // kernel's result (bytes transferred or -errno) and the completion's IORING_CQE_F_* flags. The object must stay valid
@@ -111,6 +112,11 @@ public:
 	// Asks the kernel to cancel op's in-flight operation (queued as kind); op then completes with -ECANCELED unless it
 	// finished first. The cancellation's own completion is discarded.
 	void cancel(Op* op, Kind kind);
+	// Cancels every operation in flight on fd (5.19+; no-op before). Queued, so flush() before closing fd.
+	void cancelFd(int fd);
+
+	// DEFER_TASKRUN was accepted (6.1+), which implies multishot accept and receive.
+	bool modern() const { return deferTaskrun; }
 
 	unsigned queued() const { return unsubmitted; }
 	int descriptor() const { return fd; }
@@ -190,6 +196,13 @@ void prepRecvMultishot(io_uring_sqe* sqe, int fd);
 void prepSend(io_uring_sqe* sqe, int fd, const void* buf, unsigned len, int flags);
 // msg and the iovecs it names must stay valid until the completion.
 void prepSendmsg(io_uring_sqe* sqe, int fd, const msghdr* msg, int flags);
+// A one-shot poll for events (POLLIN, POLLOUT, ...); completes with the ready events or -errno.
+void prepPoll(io_uring_sqe* sqe, int fd, unsigned events);
+// Accepts with SOCK_CLOEXEC into a blocking socket; completes with the new descriptor. A multishot accept (kernel
+// 5.19+) stays armed and completes once per connection.
+void prepAccept(io_uring_sqe* sqe, int fd, bool multishot);
+// addr must stay valid until the completion.
+void prepConnect(io_uring_sqe* sqe, int fd, const void* addr, unsigned addrLen);
 void prepRead(io_uring_sqe* sqe, int fd, void* buf, unsigned len, uint64_t offset);
 void prepWrite(io_uring_sqe* sqe, int fd, const void* buf, unsigned len, uint64_t offset);
 void prepFsync(io_uring_sqe* sqe, int fd, bool datasync);

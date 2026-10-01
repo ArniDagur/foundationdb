@@ -69,6 +69,7 @@
 #include "flow/IoUring.h"
 #ifdef __linux__
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #endif
@@ -771,6 +772,189 @@ static Reference<UringSocket> makeUringSocket(int fd, bool kernelTls) {
 	countUringConnections->increment(1);
 	return makeReference<UringSocket>(ring, fd, kernelTls);
 }
+
+// The ring for a new connection or listener when FLOW_KNOBS->NET_IO_URING covers it: plain TCP, or TLS with kernel TLS
+// (which carries the records once the handshake is done). Such sockets never use Asio's reactor: accepts, connects
+// and handshake readiness go through the ring too.
+static iouring::Ring* ringForConnections(bool tls) {
+	if (!FLOW_KNOBS->NET_IO_URING || (tls && !FLOW_KNOBS->TLS_USE_KTLS)) {
+		return nullptr;
+	}
+	return iouring::Ring::get();
+}
+
+// Before closing a ring-mode descriptor that has no UringSocket yet: completes its pending connect or polls.
+static void cancelRingSetup(int fd) {
+	if (iouring::Ring* ring = iouring::Ring::existing()) {
+		ring->cancelFd(fd);
+		ring->flush();
+	}
+	::shutdown(fd, SHUT_RDWR);
+}
+
+// Whether TLS sockets work here: the "tls" upper-layer protocol installs on an established loopback TCP socket. Checked
+// once per process.
+static bool kernelTlsAvailable() {
+	static const bool available = [] {
+		const int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		socklen_t len = sizeof(addr);
+		bool ok = listener >= 0 && bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+		          listen(listener, 1) == 0 && getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len) == 0;
+		const int client = ok ? socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0) : -1;
+		ok = ok && client >= 0 && ::connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+		const int server = ok ? accept4(listener, nullptr, nullptr, SOCK_CLOEXEC) : -1;
+		ok = ok && server >= 0 && setsockopt(client, SOL_TCP, 31 /* TCP_ULP */, "tls", sizeof("tls")) == 0;
+		for (int fd : { server, client, listener }) {
+			if (fd >= 0) {
+				::close(fd);
+			}
+		}
+		TraceEvent(ok ? SevInfo : SevWarnAlways, "N2_KernelTLSCheck").detail("Available", ok);
+		return ok;
+	}();
+	return available;
+}
+
+// A one-shot poll or connect of connection setup. It frees itself on its completion, so the waiter may go first (a
+// handshake timeout, a cancelled connect); closing the connection cancels it by descriptor.
+struct RingSetupOp final : iouring::Op {
+	Promise<int> done;
+	sockaddr_storage addr; // a connect's destination
+	void complete(int32_t res, uint32_t) override {
+		done.send(res);
+		delete this;
+	}
+};
+
+// Ready (with the events, or -errno) once fd has one of events, an error or a hangup.
+static Future<int> ringPoll(iouring::Ring* ring, int fd, unsigned events) {
+	auto* op = new RingSetupOp;
+	Future<int> f = op->done.getFuture();
+	io_uring_sqe* s = ring->sqe();
+	iouring::prepPoll(s, fd, events);
+	ring->queue(s, op, iouring::Kind::NetSetup);
+	return f;
+}
+
+// Connects fd, which must be in blocking mode; ready with 0 or -errno.
+static Future<int> ringConnect(iouring::Ring* ring, int fd, const tcp::endpoint& to) {
+	auto* op = new RingSetupOp;
+	Future<int> f = op->done.getFuture();
+	memcpy(&op->addr, to.data(), to.size());
+	io_uring_sqe* s = ring->sqe();
+	iouring::prepConnect(s, fd, &op->addr, to.size());
+	ring->queue(s, op, iouring::Kind::NetSetup);
+	return f;
+}
+
+// Accepts on a listening socket through the ring: one multishot accept where the kernel has it (5.19+), else one
+// accept at a time. Accepted descriptors (blocking, close-on-exec) wait in order for next().
+class RingAcceptor final : public ReferenceCounted<RingAcceptor> {
+public:
+	RingAcceptor(iouring::Ring* ring, int fd) : ring(ring), fd(fd), multishot(ring->modern()) { op.owner = this; }
+
+	~RingAcceptor() {
+		for (int c : ready) {
+			::close(c);
+		}
+	}
+
+	// The next accepted descriptor; connection_failed after an accept error other than a transient one.
+	Future<int> next() {
+		if (!ready.empty()) {
+			const int c = ready.front();
+			ready.pop_front();
+			arm();
+			return c;
+		}
+		waiter = Promise<int>();
+		waiting = true;
+		arm();
+		return waiter.getFuture();
+	}
+
+	// Must run before the listening descriptor is closed.
+	void stop() {
+		if (stopped) {
+			return;
+		}
+		stopped = true;
+		if (pending) {
+			ring->cancel(&op, iouring::Kind::NetSetup);
+			ring->flush();
+		}
+		if (hasWaiter()) {
+			waiting = false;
+			waiter.sendError(connection_failed());
+		}
+	}
+
+private:
+	struct AcceptOp final : iouring::Op {
+		RingAcceptor* owner = nullptr;
+		Reference<RingAcceptor> keepAlive;
+		void complete(int32_t res, uint32_t flags) override { owner->accepted(res, flags); }
+	};
+
+	// An accept() caller still holds the future (a cancelled accept() drops it; its connection then waits in ready).
+	bool hasWaiter() const { return waiting && waiter.getFutureReferenceCount() > 0; }
+
+	void arm() {
+		// A single-shot accept is only armed while someone waits; a multishot one stays armed.
+		if (pending || stopped || (!multishot && !hasWaiter())) {
+			return;
+		}
+		pending = true;
+		op.keepAlive = Reference<RingAcceptor>::addRef(this);
+		io_uring_sqe* s = ring->sqe();
+		iouring::prepAccept(s, fd, multishot);
+		ring->queue(s, &op, iouring::Kind::NetSetup);
+	}
+
+	void accepted(int32_t res, uint32_t flags) {
+		Reference<RingAcceptor> self;
+		if (!(multishot && (flags & iouring::kCqeMore))) {
+			self = std::move(op.keepAlive);
+			pending = false;
+		}
+		if (res >= 0) {
+			if (stopped) {
+				::close(res);
+			} else if (hasWaiter()) {
+				waiting = false;
+				Promise<int> w = std::move(waiter);
+				w.send(res);
+			} else {
+				ready.push_back(res);
+			}
+		} else if (res != -ECANCELED && res != -ECONNABORTED && res != -EAGAIN && res != -EINTR) {
+			TraceEvent(SevWarn, "N2_AcceptError")
+			    .suppressFor(1.0)
+			    .detail("ErrorCode", -res)
+			    .detail("Message", strerror(-res));
+			if (hasWaiter()) {
+				waiting = false;
+				Promise<int> w = std::move(waiter);
+				w.sendError(connection_failed());
+			}
+			return;
+		}
+		arm();
+	}
+
+	iouring::Ring* ring;
+	int fd;
+	bool multishot;
+	bool pending = false;
+	bool stopped = false;
+	std::deque<int> ready;
+	Promise<int> waiter;
+	bool waiting = false;
+	AcceptOp op;
+};
 #endif
 
 class Connection final : public IConnection, ReferenceCounted<Connection> {
@@ -792,12 +976,22 @@ public:
 #endif
 
 	// This is not part of the IConnection interface, because it is wrapped by INetwork::connect()
-	static Future<Reference<IConnection>> connect(boost::asio::io_context* ios, NetworkAddress addr) {
+	static Future<Reference<IConnection>> connect(boost::asio::io_context* ios,
+	                                              NetworkAddress addr,
+	                                              bool allowRing = true) {
 		Reference<Connection> self(new Connection(*ios));
 
 		self->peer_address = addr;
 		try {
 			auto to = tcpEndpoint(addr);
+#ifdef __linux__
+			if (iouring::Ring* ring = allowRing ? ringForConnections(false) : nullptr) {
+				self->ringMode = true;
+				co_await connectOnRing(self->socket, ring, to, self->id, addr);
+				self->init();
+				co_return self;
+			}
+#endif
 			BindPromise p("N2_ConnectError", self->id, self->peer_address);
 			Future<Void> onConnected = p.getFuture();
 			self->socket.async_connect(to, std::move(p));
@@ -817,6 +1011,47 @@ public:
 		this->peer_address = peerAddr;
 		init();
 	}
+
+#ifdef __linux__
+	// Takes a descriptor the ring accepted.
+	void acceptFromRing(int fd, bool v6) {
+		peer_address = adoptRingSocket(socket, fd, v6, false);
+		ringMode = true;
+		init();
+	}
+
+	// Opens socket and connects it to `to` through the ring, outside Asio's reactor; leaves it in blocking mode.
+	static Future<Void> connectOnRing(tcp::socket& socket,
+	                                  iouring::Ring* ring,
+	                                  tcp::endpoint to,
+	                                  UID id,
+	                                  NetworkAddress peer) {
+		socket.open(to.protocol());
+		const int fd = socket.native_handle();
+		g_net2->reactor.unwatchDescriptor(fd);
+		const int res = co_await ringConnect(ring, fd, to);
+		if (res < 0) {
+			TraceEvent(SevWarn, "N2_ConnectError", id)
+			    .suppressFor(1.0)
+			    .detail("PeerAddr", peer)
+			    .detail("PeerAddress", peer)
+			    .detail("ErrorCode", -res)
+			    .detail("Message", strerror(-res));
+			throw connection_failed();
+		}
+	}
+
+	// Gives an accepted descriptor to socket outside Asio's reactor and returns the peer's address.
+	static NetworkAddress adoptRingSocket(tcp::socket& socket, int fd, bool v6, bool tls) {
+		socket.assign(v6 ? tcp::v6() : tcp::v4(), fd);
+		g_net2->reactor.unwatchDescriptor(fd);
+		boost::system::error_code ec;
+		const tcp::endpoint peer = socket.remote_endpoint(ec);
+		const IPAddress ip = peer.address().is_v6() ? IPAddress(peer.address().to_v6().to_bytes())
+		                                            : IPAddress(peer.address().to_v4().to_uint());
+		return NetworkAddress(ip, peer.port(), false, tls);
+	}
+#endif
 
 	Future<Void> acceptHandshake() override { return Void(); }
 
@@ -952,6 +1187,7 @@ private:
 	NetworkAddress peer_address;
 #ifdef __linux__
 	Reference<UringSocket> uring;
+	bool ringMode = false; // created through the ring; Asio's reactor never watches it
 #endif
 
 	void init() {
@@ -977,6 +1213,8 @@ private:
 #ifdef __linux__
 		if (uring) {
 			uring->shutdownForClose();
+		} else if (ringMode && socket.is_open()) {
+			cancelRingSetup(socket.native_handle());
 		}
 #endif
 		boost::system::error_code error;
@@ -1194,6 +1432,9 @@ class Listener final : public IListener, ReferenceCounted<Listener> {
 	boost::asio::io_context& io_service;
 	NetworkAddress listenAddress;
 	tcp::acceptor acceptor;
+#ifdef __linux__
+	Reference<RingAcceptor> ringAcceptor;
+#endif
 
 public:
 	Listener(boost::asio::io_context& io_service, NetworkAddress listenAddress)
@@ -1206,13 +1447,50 @@ public:
 			        std::to_string(acceptor.local_endpoint().port())));
 		}
 		platform::setCloseOnExec(acceptor.native_handle());
+#ifdef __linux__
+		if (iouring::Ring* ring = ringForConnections(false)) {
+			g_net2->reactor.unwatchDescriptor(acceptor.native_handle());
+			ringAcceptor = makeReference<RingAcceptor>(ring, acceptor.native_handle());
+		}
+#endif
 	}
+
+#ifdef __linux__
+	~Listener() {
+		if (ringAcceptor) {
+			ringAcceptor->stop();
+		}
+	}
+#endif
 
 	void addref() override { ReferenceCounted<Listener>::addref(); }
 	void delref() override { ReferenceCounted<Listener>::delref(); }
 
 	// Returns one incoming connection when it is available
 	Future<Reference<IConnection>> accept() override {
+#ifdef __linux__
+		if (ringAcceptor) {
+			return acceptFromRing(Reference<Listener>::addRef(this));
+		}
+#endif
+		return acceptFromAsio();
+	}
+
+#ifdef __linux__
+	static Future<Reference<IConnection>> acceptFromRing(Reference<Listener> self) {
+		const int fd = co_await self->ringAcceptor->next();
+		Reference<Connection> conn(new Connection(self->io_service));
+		try {
+			conn->acceptFromRing(fd, self->listenAddress.ip.isV6());
+		} catch (...) {
+			conn->close();
+			throw;
+		}
+		co_return conn;
+	}
+#endif
+
+	Future<Reference<IConnection>> acceptFromAsio() {
 		Reference<Connection> conn(new Connection(io_service));
 		tcp::acceptor::endpoint_type peer_endpoint;
 		try {
@@ -1342,6 +1620,15 @@ struct SSLHandshakerThread final : IThreadPoolReceiver {
 	}
 };
 
+#if defined(__linux__) && defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+// The TLS 1.3 suites and TLS 1.2 ciphers kernel TLS (and OpenSSL's use of it) can carry.
+static constexpr const char* kKernelTlsCiphersuites =
+    "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256";
+static constexpr const char* kKernelTlsCiphers = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+                                                 "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+                                                 "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+#endif
+
 class SSLConnection final : public IConnection, ReferenceCounted<SSLConnection> {
 public:
 	void addref() override { ReferenceCounted<SSLConnection>::addref(); }
@@ -1371,7 +1658,8 @@ public:
 	                                              Reference<ReferencedObject<boost::asio::ssl::context>> context,
 	                                              NetworkAddress addr,
 	                                              tcp::socket* existingSocket = nullptr,
-	                                              std::string hostname = {}) {
+	                                              std::string hostname = {},
+	                                              bool allowRing = true) {
 		std::pair<IPAddress, uint16_t> peerIP = std::make_pair(addr.ip, addr.port);
 		auto iter(g_network->networkInfo.serverTLSConnectionThrottler.find(peerIP));
 		if (iter != g_network->networkInfo.serverTLSConnectionThrottler.end()) {
@@ -1401,6 +1689,14 @@ public:
 		self->sni_hostname = std::move(hostname);
 		try {
 			auto to = tcpEndpoint(self->peer_address);
+#ifdef __linux__
+			if (iouring::Ring* ring = allowRing ? ringForConnections(true) : nullptr) {
+				self->ringMode = true;
+				co_await Connection::connectOnRing(self->socket, ring, to, self->id, addr);
+				self->init(); // non-blocking for the handshake; the UringSocket takes it back to blocking
+				co_return self;
+			}
+#endif
 			BindPromise p("N2_ConnectError", self->id, self->peer_address);
 			Future<Void> onConnected = p.getFuture();
 			self->socket.async_connect(to, std::move(p));
@@ -1421,6 +1717,15 @@ public:
 		init();
 	}
 
+#ifdef __linux__
+	// Takes a descriptor the ring accepted.
+	void acceptFromRing(int fd, bool v6) {
+		peer_address = Connection::adoptRingSocket(socket, fd, v6, true);
+		ringMode = true;
+		init();
+	}
+#endif
+
 	static Future<Void> doAcceptHandshake(Uncancellable, Reference<SSLConnection> self, Promise<Void> connected) {
 		Hold<int> holder;
 
@@ -1434,8 +1739,10 @@ public:
 
 			// If the background handshakers are not all busy, use one
 			// FIXME: see comment elsewhere about making this the only path.
-			if ((FLOW_KNOBS->DISABLE_MAINTHREAD_TLS_HANDSHAKE && N2::g_net2->sslHandshakerThreadsStarted > 0) ||
-			    N2::g_net2->sslPoolHandshakesInProgress < N2::g_net2->sslHandshakerThreadsStarted) {
+			// Ring-mode connections shake hands on the network thread, waiting on the ring.
+			if (!self->ringMode &&
+			    ((FLOW_KNOBS->DISABLE_MAINTHREAD_TLS_HANDSHAKE && N2::g_net2->sslHandshakerThreadsStarted > 0) ||
+			     N2::g_net2->sslPoolHandshakesInProgress < N2::g_net2->sslHandshakerThreadsStarted)) {
 				static SimpleCounter<int64_t>* countServerTLSHandshakesOnSideThreads =
 				    SimpleCounter<int64_t>::makeCounter("/Net2/TLS/ServerTLSHandshakesOnSideThreads");
 				countServerTLSHandshakesOnSideThreads->increment(1);
@@ -1562,8 +1869,10 @@ public:
 			// unpredictable system performance and reliability) is
 			// much, much higher than the cost a few hundred or
 			// thousand incremental threads.
-			if ((FLOW_KNOBS->DISABLE_MAINTHREAD_TLS_HANDSHAKE && N2::g_net2->sslHandshakerThreadsStarted > 0) ||
-			    N2::g_net2->sslPoolHandshakesInProgress < N2::g_net2->sslHandshakerThreadsStarted) {
+			// Ring-mode connections shake hands on the network thread, waiting on the ring.
+			if (!self->ringMode &&
+			    ((FLOW_KNOBS->DISABLE_MAINTHREAD_TLS_HANDSHAKE && N2::g_net2->sslHandshakerThreadsStarted > 0) ||
+			     N2::g_net2->sslPoolHandshakesInProgress < N2::g_net2->sslHandshakerThreadsStarted)) {
 				static SimpleCounter<int64_t>* countClientTLSHandshakesOnSideThreads =
 				    SimpleCounter<int64_t>::makeCounter("/Net2/TLS/ClientTLSHandshakesOnSideThreads");
 				countClientTLSHandshakesOnSideThreads->increment(1);
@@ -1645,6 +1954,9 @@ public:
 		if (uring) {
 			return uring->onWritable();
 		}
+		if (ringMode) {
+			return success(ringPoll(iouring::Ring::existing(), socket.native_handle(), POLLOUT));
+		}
 #endif
 		BindPromise p("N2_WriteProbeError", id, peer_address);
 		auto f = p.getFuture();
@@ -1658,6 +1970,9 @@ public:
 #ifdef __linux__
 		if (uring) {
 			return uring->onReadable();
+		}
+		if (ringMode) {
+			return success(ringPoll(iouring::Ring::existing(), socket.native_handle(), POLLIN));
 		}
 #endif
 		BindPromise p("N2_ReadProbeError", id, peer_address);
@@ -1811,6 +2126,7 @@ private:
 #ifdef __linux__
 	// With FLOW_KNOBS->NET_IO_URING, once the kernel encrypts and decrypts both directions.
 	Reference<UringSocket> uring;
+	bool ringMode = false; // created through the ring; Asio's reactor never watches it
 #endif
 
 	void init() {
@@ -1820,16 +2136,38 @@ private:
 		platform::setCloseOnExec(socket.native_handle());
 	}
 
-	// Must be called before the handshake starts.
+	// Must be called before the handshake starts. With FLOW_KNOBS->TLS_USE_KTLS kernel TLS is mandatory: only ciphers
+	// the kernel can take are offered, so a peer without one fails the handshake, and noteKtlsState() fails a
+	// connection the kernel did not take in both directions. There is no user-space fallback.
 	void prepareKtls() {
-#if defined(__linux__) && defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
 		if (!FLOW_KNOBS->TLS_USE_KTLS) {
 			return;
 		}
+#if defined(__linux__) && defined(SSL_OP_ENABLE_KTLS) && !defined(OPENSSL_NO_KTLS)
+		if (!kernelTlsAvailable()) {
+			TraceEvent(SevWarnAlways, "N2_KernelTLSUnavailable", id)
+			    .suppressFor(60.0)
+			    .detail("PeerAddress", peer_address);
+			throw connection_failed();
+		}
 		blockSigpipeOnThisThread();
 		SSL* ssl = ssl_sock.native_handle();
+		if (SSL_set_ciphersuites(ssl, kKernelTlsCiphersuites) != 1 ||
+		    SSL_set_cipher_list(ssl, kKernelTlsCiphers) != 1) {
+			TraceEvent(SevWarnAlways, "N2_KernelTLSCiphersFailed", id)
+			    .suppressFor(60.0)
+			    .detail("ErrorCode", ERR_peek_error());
+			throw connection_failed();
+		}
 		SSL_set_options(ssl, SSL_OP_ENABLE_KTLS);
 		opensslOwnsSocket = SSL_set_fd(ssl, socket.native_handle()) == 1;
+		if (!opensslOwnsSocket) {
+			TraceEvent(SevWarnAlways, "N2_KernelTLSSetFdFailed", id).suppressFor(60.0);
+			throw connection_failed();
+		}
+#else
+		TraceEvent(SevWarnAlways, "N2_KernelTLSUnsupported", id).suppressFor(60.0);
+		throw connection_failed();
 #endif
 	}
 
@@ -1857,17 +2195,18 @@ private:
 			    setsockopt(
 			        socket.native_handle(), 282 /* SOL_TLS */, 4 /* TLS_RX_EXPECT_NO_PAD */, &one, sizeof(one)) == 0);
 		}
-		if (ktlsSend && ktlsRecv) {
-			// Application data is now plain socket I/O.
-			uring = makeUringSocket(socket.native_handle(), /*kernelTls=*/true);
-		}
-		TraceEvent("N2_TLSKernelOffload", id)
-		    .suppressFor(60.0)
+		TraceEvent(ktlsSend && ktlsRecv ? SevInfo : SevWarnAlways, "N2_TLSKernelOffload", id)
+		    .suppressFor(ktlsSend && ktlsRecv ? 60.0 : 1.0)
 		    .detail("PeerAddress", peer_address)
 		    .detail("Version", SSL_get_version(ssl))
 		    .detail("Cipher", SSL_get_cipher(ssl))
 		    .detail("Send", ktlsSend)
 		    .detail("Recv", ktlsRecv);
+		if (!(ktlsSend && ktlsRecv)) {
+			throw connection_failed(); // kernel TLS is mandatory with the knob (prepareKtls())
+		}
+		// Application data is now plain socket I/O.
+		uring = makeUringSocket(socket.native_handle(), /*kernelTls=*/true);
 #endif
 	}
 
@@ -1971,6 +2310,8 @@ private:
 #ifdef __linux__
 		if (uring) {
 			uring->shutdownForClose();
+		} else if (ringMode && socket.is_open()) {
+			cancelRingSetup(socket.native_handle());
 		}
 #endif
 		boost::system::error_code cancelError;
@@ -2010,6 +2351,9 @@ class SSLListener final : public IListener, ReferenceCounted<SSLListener> {
 	NetworkAddress listenAddress;
 	tcp::acceptor acceptor;
 	AsyncVar<Reference<ReferencedObject<boost::asio::ssl::context>>>* contextVar;
+#ifdef __linux__
+	Reference<RingAcceptor> ringAcceptor;
+#endif
 
 public:
 	SSLListener(boost::asio::io_context& io_service,
@@ -2028,13 +2372,50 @@ public:
 			                                                .append(listenAddress.isTLS() ? ":tls" : ""));
 		}
 		platform::setCloseOnExec(acceptor.native_handle());
+#ifdef __linux__
+		if (iouring::Ring* ring = ringForConnections(true)) {
+			g_net2->reactor.unwatchDescriptor(acceptor.native_handle());
+			ringAcceptor = makeReference<RingAcceptor>(ring, acceptor.native_handle());
+		}
+#endif
 	}
+
+#ifdef __linux__
+	~SSLListener() {
+		if (ringAcceptor) {
+			ringAcceptor->stop();
+		}
+	}
+#endif
 
 	void addref() override { ReferenceCounted<SSLListener>::addref(); }
 	void delref() override { ReferenceCounted<SSLListener>::delref(); }
 
 	// Returns one incoming connection when it is available
 	Future<Reference<IConnection>> accept() override {
+#ifdef __linux__
+		if (ringAcceptor) {
+			return acceptFromRing(Reference<SSLListener>::addRef(this));
+		}
+#endif
+		return acceptFromAsio();
+	}
+
+#ifdef __linux__
+	static Future<Reference<IConnection>> acceptFromRing(Reference<SSLListener> self) {
+		const int fd = co_await self->ringAcceptor->next();
+		Reference<SSLConnection> conn(new SSLConnection(self->io_service, self->contextVar->get()));
+		try {
+			conn->acceptFromRing(fd, self->listenAddress.ip.isV6());
+		} catch (...) {
+			conn->close();
+			throw;
+		}
+		co_return conn;
+	}
+#endif
+
+	Future<Reference<IConnection>> acceptFromAsio() {
 		Reference<SSLConnection> conn(new SSLConnection(io_service, contextVar->get()));
 		tcp::acceptor::endpoint_type peer_endpoint;
 		try {
@@ -2160,6 +2541,13 @@ void Net2::initTLS(ETLSInitState targetState) {
 			    .detail("VerifyPeers", boost::algorithm::join(loaded.getVerifyPeers(), "|"))
 			    .detail("DisablePlainTextConnection", tlsConfig.getDisablePlainTextConnection());
 			auto loadedTlsConfig = tlsConfig.loadSync();
+#ifdef __linux__
+			if (FLOW_KNOBS->TLS_USE_KTLS && !kernelTlsAvailable()) {
+				// Kernel TLS is mandatory with the knob; no TLS connection could succeed.
+				TraceEvent(SevError, "N2_KernelTLSUnavailable").log();
+				throw tls_error();
+			}
+#endif
 			ConfigureSSLContext(loadedTlsConfig, newContext);
 			activeTlsPolicy = makeReference<TLSPolicy>(loadedTlsConfig, onPolicyFailure);
 			sslContextVar.set(ReferencedObject<boost::asio::ssl::context>::from(std::move(newContext)));
@@ -2172,8 +2560,9 @@ void Net2::initTLS(ETLSInitState targetState) {
 		    reloadCertificatesOnChange(tlsConfig, onPolicyFailure, &sslContextVar, &activeTlsPolicy);
 	}
 
-	// If a TLS connection is actually going to be used then start background threads if configured
-	if (targetState > ETLSInitState::CONFIG) {
+	// If a TLS connection is actually going to be used then start background threads if configured. Ring-mode
+	// connections (FLOW_KNOBS->NET_IO_URING with kernel TLS) shake hands on the network thread instead.
+	if (targetState > ETLSInitState::CONFIG && !(FLOW_KNOBS->NET_IO_URING && FLOW_KNOBS->TLS_USE_KTLS)) {
 		int threadsToStart;
 		switch (targetState) {
 		case ETLSInitState::CONNECT:
@@ -2666,16 +3055,25 @@ Future<Reference<IConnection>> Net2::connect(NetworkAddress toAddr, tcp::socket*
 	return Connection::connect(&this->reactor.ios, toAddr);
 }
 
+// External connections (HTTP, blob stores) stay on Asio: their users may take the socket over (getSocket()).
 Future<Reference<IConnection>> Net2::connectExternal(NetworkAddress toAddr) {
-	return connect(toAddr);
+	if (toAddr.isTLS()) {
+		initTLS(ETLSInitState::CONNECT);
+		return SSLConnection::connect(&this->reactor.ios, this->sslContextVar.get(), toAddr, nullptr, {}, false);
+	}
+	if (tlsConfig.getDisablePlainTextConnection()) {
+		TraceEvent(SevError, "PlainTextConnectionDisabled").detail("toAddr", toAddr);
+		throw connection_failed();
+	}
+	return Connection::connect(&this->reactor.ios, toAddr, false);
 }
 
 Future<Reference<IConnection>> Net2::connectExternalWithHostname(NetworkAddress toAddr, const std::string& hostname) {
 	if (toAddr.isTLS()) {
 		initTLS(ETLSInitState::CONNECT);
-		return SSLConnection::connect(&this->reactor.ios, this->sslContextVar.get(), toAddr, nullptr, hostname);
+		return SSLConnection::connect(&this->reactor.ios, this->sslContextVar.get(), toAddr, nullptr, hostname, false);
 	}
-	return connect(toAddr);
+	return connectExternal(toAddr);
 }
 
 Future<Reference<IUDPSocket>> Net2::createUDPSocket(NetworkAddress toAddr) {
