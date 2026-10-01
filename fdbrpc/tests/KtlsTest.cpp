@@ -25,7 +25,7 @@
 // such a cipher must be refused, and without the kernel tls module every handshake must fail. A plain-OpenSSL client
 // with a kernel-capable cipher must interoperate with the Net2 server, and peer verification must still reject a client
 // whose chain has a different root. A handshake write to a connection shut down for writing, and data writes to a
-// connection the peer reset, must fail cleanly, not raise SIGPIPE.
+// connection the peer reset, must fail cleanly, not raise SIGPIPE, and leave no SIGPIPE pending.
 // Plain TCP connections get the same data checks, plus a sender that fills the socket while the receiver waits.
 //
 // With --net-io-uring (FLOW_KNOBS->NET_IO_URING), plain TCP connections and kernel TLS connections must be accepted,
@@ -39,6 +39,7 @@
 //   ktls_unittest [--net-io-uring [--no-multishot] [--recv-buffers=N]] [--main-thread-handshakes]
 //                 [--openssl-conf=tls12|cbc]
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
@@ -428,6 +429,15 @@ Future<Void> sigpipeCheck(std::string label, bool tls = true) {
 		client->close();
 		server->close();
 	}
+	// libcoro's swapcontext loads the signal mask saved with each coroutine, which need not block SIGPIPE, so a SIGPIPE
+	// these writes left pending on the network thread would kill the process at the next coroutine switch.
+	sigset_t pending;
+	sigpending(&pending);
+	check(!sigismember(&pending, SIGPIPE), label + ": the failed writes leave no SIGPIPE pending");
+	sigset_t sigpipeOnly;
+	sigemptyset(&sigpipeOnly);
+	sigaddset(&sigpipeOnly, SIGPIPE);
+	pthread_sigmask(SIG_UNBLOCK, &sigpipeOnly, nullptr);
 }
 
 // One connection's checks. tls = false: a plain TCP connection. useKtls: kernel TLS is mandatory, so the handshake

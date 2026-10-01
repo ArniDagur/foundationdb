@@ -1517,18 +1517,25 @@ public:
 using ssl_socket = boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>;
 
 // OpenSSL writes to sockets it owns with write() and sendmsg() without MSG_NOSIGNAL, so writing to a connection the
-// peer has closed raises SIGPIPE, whose default action kills the process. With SIGPIPE blocked on the writing thread
-// the write fails with EPIPE instead; the signal stays pending there, which is harmless while it remains blocked.
-static void blockSigpipeOnThisThread() {
+// peer has closed raises SIGPIPE, whose default action kills the process. A process-wide no-op handler makes such a
+// write fail with EPIPE on every thread. Blocking the signal per thread is not enough: libcoro switches coroutines with
+// swapcontext, which loads the signal mask saved with each coroutine, so a SIGPIPE left pending on the network thread
+// is delivered as soon as it switches to a coroutine created before the signal was blocked. Unlike SIG_IGN, a handler
+// is reset to the default action in exec'd children. An existing disposition is left alone.
+static void ignoreSigpipe() {
 #if defined(__unixish__)
-	thread_local bool blocked = false;
-	if (!blocked) {
-		sigset_t set;
-		sigemptyset(&set);
-		sigaddset(&set, SIGPIPE);
-		pthread_sigmask(SIG_BLOCK, &set, nullptr);
-		blocked = true;
-	}
+	[[maybe_unused]] static const bool installed = [] {
+		struct sigaction current{};
+		if (sigaction(SIGPIPE, nullptr, &current) != 0 || (current.sa_flags & SA_SIGINFO) ||
+		    current.sa_handler != SIG_DFL) {
+			return false;
+		}
+		struct sigaction action{};
+		action.sa_handler = [](int) {};
+		sigemptyset(&action.sa_mask);
+		action.sa_flags = SA_RESTART;
+		return sigaction(SIGPIPE, &action, nullptr) == 0;
+	}();
 #endif
 }
 
@@ -1555,7 +1562,7 @@ static void opensslHandshake(SSL* ssl, ssl_socket::handshake_type type, boost::s
 
 struct SSLHandshakerThread final : IThreadPoolReceiver {
 	SSLHandshakerThread() = default;
-	void init() override { blockSigpipeOnThisThread(); }
+	void init() override {}
 
 	struct Handshake final : TypedAction<SSLHandshakerThread, Handshake> {
 		Handshake(ssl_socket& socket, ssl_socket::handshake_type type) : socket(socket), type(type) {}
@@ -2151,7 +2158,7 @@ private:
 			    .detail("PeerAddress", peer_address);
 			throw connection_failed();
 		}
-		blockSigpipeOnThisThread();
+		ignoreSigpipe();
 		SSL* ssl = ssl_sock.native_handle();
 		if (SSL_set_ciphersuites(ssl, kKernelTlsCiphersuites) != 1 ||
 		    SSL_set_cipher_list(ssl, kKernelTlsCiphers) != 1) {
