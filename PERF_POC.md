@@ -13,6 +13,7 @@ of an A/B comparison.
 | `TLS_USE_KTLS` | Kernel TLS is mandatory. Only ciphers the kernel can carry are offered (TLS 1.3 AES-GCM and ChaCha20-Poly1305; TLS 1.2 ECDHE with the same), OpenSSL installs the traffic keys in the kernel after the handshake, and a connection the kernel does not take in both directions fails. There is no user-space fallback; the process checks at TLS setup that the kernel has TLS sockets. TLS 1.3 session tickets are off, and `TLS_RX_EXPECT_NO_PAD` lets the kernel decrypt straight into the receive buffer. |
 | `NET_IO_URING` | Plain TCP connections and kernel TLS connections are accepted, connected, shake hands (TLS) and move their data through the network thread's io_uring, and the run loop waits on the ring instead of epoll. These sockets are never in Asio's epoll set, and handshakes run on the network thread (no handshake thread pool). External connections (HTTP, blob stores) stay on Asio. |
 | `KAIO_IO_URING` | `AsyncFileKAIO` reads, writes and fdatasyncs (TLog disk queue, Redwood) go through the same ring instead of libaio and the EIO thread pool. |
+| `KAIO_ZERO_FILL_GROWTH` | KAIO files grow with written zeros instead of `fallocate` (unwritten extents), `zeroRange` writes zeros, and unwritten ranges already in a file are written with zeros when it is opened. |
 | `NET_IO_URING_MULTISHOT`, `NET_IO_URING_RECV_BUFFERS`, `NET_IO_URING_RECV_BYTES`, `NET_IO_URING_MAX_QUEUED_BYTES`, `IO_URING_ENTRIES`, `IO_URING_MAX_WORKERS`, `IO_URING_METRICS_INTERVAL` | Multishot receives into a shared provided-buffer ring (on where the kernel supports it), its size, the per-connection unread-data cap, the ring size, the io-wq worker cap, and the `IoUringMetrics` interval. |
 
 ## How it works
@@ -44,13 +45,19 @@ of an A/B comparison.
   a time into a per-connection buffer. On kernel TLS sockets a non-data record
   (`-EIO` from a plain receive) goes to OpenSSL and receiving resumes.
 - **KAIO**: each run-loop iteration's queued iocbs become `READ`, `WRITE` and
-  `FSYNC(DATASYNC)` entries on the same ring. io_uring first tries an O_DIRECT
-  write without blocking, and XFS cannot update the file's mtime and ctime that
-  way, so such writes went to io-wq worker threads (62% of a storage server's
-  writes and 16% of its reads at saturation, with ~700 worker threads). KAIO
-  now refreshes the file's times once per coarse-clock tick before ring writes
-  (what libaio does inline), so the writes after it in that tick stay
-  asynchronous.
+  `FSYNC(DATASYNC)` entries on the same ring. io_uring first tries each
+  O_DIRECT read and write without blocking and hands what would block to io-wq
+  worker threads. On XFS, every write into an unwritten (fallocated) extent is
+  converted by a transaction that holds the inode lock exclusively, so
+  concurrent non-blocking attempts fail: a storage server punted 62% of its
+  writes and 16% of its reads at saturation, with ~700 worker threads, because
+  Redwood grows its file with `fallocate` in 160 MB steps. libaio waits on the
+  lock instead. With `KAIO_ZERO_FILL_GROWTH`, growth and `zeroRange` write
+  zeros in 1 MB writes and unwritten ranges are written at open, so page writes
+  land on written extents (a probe on the same disks: 4 µs CPU per 8 KB write
+  and 1–2 worker threads, against 22 µs and 1792 threads into unwritten
+  extents). Refreshing the file times before writes, tried first, made punting
+  worse and was dropped. The io-wq worker count is capped as a backstop.
 - **Observability**: `IoUringReady` (setup flags, features, buffer ring,
   worker cap), `IoUringMetrics` every 5 s (enters, waits, submissions and
   completions per kind, buffer-ring exhaustion, receive pauses),

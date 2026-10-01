@@ -523,9 +523,10 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
 	}
 }
 
-// With KAIO_ZERO_FILL_GROWTH a KAIO file has no unwritten extents: those already in the file are written with zeros
-// at open (keeping any data), growth writes zeros instead of fallocating, and zeroRange writes zeros. Without the
-// knob, growth leaves unwritten extents (where the filesystem has them, which makes the rest meaningful).
+// With KAIO_ZERO_FILL_GROWTH a single-owner KAIO file (a Redwood page file here) has no unwritten extents: those
+// already in it are written with zeros at open (keeping any data), growth writes zeros instead of fallocating, and
+// zeroRange writes zeros. While a second handle has the file open, growth through it must not zero the other's data.
+// Without the knob, growth leaves unwritten extents (where the filesystem has them, which makes the rest meaningful).
 TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillGrowth") {
 	if (g_network->isSimulated()) {
 		co_return;
@@ -535,9 +536,9 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillGrowth") {
 	const bool savedRing = knobs->KAIO_IO_URING;
 	knobs->KAIO_IO_URING = true;
 	constexpr int64_t MB = 1 << 20;
-	const std::string filename =
-	    joinPath(params.getDataDir(),
-	             format("__KAIO_ZERO_FILL_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str()));
+	const std::string filename = joinPath(
+	    params.getDataDir(),
+	    format("__KAIO_ZERO_FILL_TEST_%s__.redwood-v1", deterministicRandom()->randomUniqueID().toString().c_str()));
 	uint8_t* page = static_cast<uint8_t*>(allocateFast4kAligned(4096));
 	Reference<IAsyncFile> f;
 	Optional<Error> err;
@@ -606,6 +607,19 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillGrowth") {
 			ASSERT_EQ(unwritten(16 * MB), 0);
 			const int64_t filled = AsyncFileKAIO::getZeroFilledBytes() - filledBefore;
 			ASSERT(filled >= before + 8 * MB);
+			// A second handle on the file turns zero filling off for both: growth through one handle must not zero
+			// data the other just wrote past its idea of the end of the file.
+			{
+				Reference<IAsyncFile> g = co_await AsyncFileKAIO::open(
+				    filename, IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE, 0644, nullptr);
+				memset(page, 0xcd, 4096);
+				co_await f->write(page, 4096, 16 * MB); // f extends the file; g still thinks it is 16 MB
+				co_await g->truncate(20 * MB);
+				co_await readPage(16 * MB);
+				for (int i = 0; i < 4096; i++) {
+					ASSERT_EQ(page[i], 0xcd);
+				}
+			}
 			// Without the knob, growth fallocates again.
 			knobs->KAIO_ZERO_FILL_GROWTH = false;
 			co_await f->truncate(24 * MB);

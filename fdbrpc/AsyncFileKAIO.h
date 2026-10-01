@@ -35,6 +35,7 @@
 #include <linux/fs.h>
 #include <linux/io_uring.h>
 #include <atomic>
+#include <map>
 #include <type_traits>
 #include "linux_kaio.h"
 #include "flow/Knobs.h"
@@ -194,7 +195,9 @@ public:
 			return io_error();
 		}
 		r->lastFileSize = r->nextFileSize = buf.st_size;
-		if (FLOW_KNOBS->KAIO_ZERO_FILL_GROWTH && (flags & OPEN_READWRITE)) {
+		r->inode = { buf.st_dev, buf.st_ino };
+		++openHandles()[r->inode];
+		if ((flags & OPEN_READWRITE) && r->mayZeroFill()) {
 			return writeUnwrittenRanges(r);
 		}
 		return Reference<IAsyncFile>(std::move(r));
@@ -245,6 +248,26 @@ public:
 			}
 		}
 		return ranges;
+	}
+
+	// Zero filling writes over ranges this handle believes hold no data, so it is only safe for a file with a single
+	// writer: Redwood page files and DiskQueue files, each opened once by its owner, and only while no other handle of
+	// this process has the file open. SQLite opens its database once per connection; zero filling there destroyed
+	// pages another handle had just written.
+	bool mayZeroFill() const {
+		if (!FLOW_KNOBS->KAIO_ZERO_FILL_GROWTH) {
+			return false;
+		}
+		const bool singleOwnerKind =
+		    StringRef(filename).endsWith(".redwood-v1"_sr) || StringRef(filename).endsWith(".fdq"_sr);
+		auto it = openHandles().find(inode);
+		return singleOwnerKind && it != openHandles().end() && it->second == 1;
+	}
+
+	// Open KAIO handles of this process per file (network thread only).
+	static std::map<std::pair<dev_t, ino_t>, int>& openHandles() {
+		static std::map<std::pair<dev_t, ino_t>, int> handles;
+		return handles;
 	}
 
 	// Writes zeros over [begin, end) (4 KiB aligned) through this file's own I/O path, a few megabytes at a time.
@@ -402,7 +425,7 @@ public:
 #define FALLOC_FL_ZERO_RANGE 0x10
 #endif
 	Future<Void> zeroRange(int64_t offset, int64_t length) override {
-		if (FLOW_KNOBS->KAIO_ZERO_FILL_GROWTH && offset % 4096 == 0 && length % 4096 == 0) {
+		if (mayZeroFill() && offset % 4096 == 0 && length % 4096 == 0) {
 			return writeZeros(offset, offset + length); // FALLOC_FL_ZERO_RANGE would leave unwritten extents
 		}
 		bool success = false;
@@ -432,7 +455,7 @@ public:
 		KAIOLogEvent(logFile, id, OpLogEntry::TRUNCATE, OpLogEntry::START, size / 4096);
 		bool completed = false;
 		double begin = timer_monotonic();
-		if (FLOW_KNOBS->KAIO_ZERO_FILL_GROWTH && size > lastFileSize && lastFileSize % 4096 == 0 && size % 4096 == 0) {
+		if (mayZeroFill() && size > lastFileSize && lastFileSize % 4096 == 0 && size % 4096 == 0) {
 			// Grow with written zeros instead of unwritten extents (see writeUnwrittenRanges()). The new size is
 			// recorded first so that launch() does not fallocate ahead of the zero writes.
 			const int64_t from = lastFileSize;
@@ -584,6 +607,12 @@ public:
 	int64_t debugFD() const override { return fd; }
 	std::string getFilename() const override { return filename; }
 	~AsyncFileKAIO() override {
+		if (inode.second) {
+			auto it = openHandles().find(inode);
+			if (it != openHandles().end() && --it->second == 0) {
+				openHandles().erase(it);
+			}
+		}
 		close(fd);
 
 #if KAIO_LOGGING
@@ -705,6 +734,7 @@ public:
 private:
 	int fd, flags;
 	int64_t lastFileSize, nextFileSize;
+	std::pair<dev_t, ino_t> inode{ 0, 0 };
 	std::string filename;
 	Int64MetricHandle countFileLogicalWrites;
 	Int64MetricHandle countFileLogicalReads;
