@@ -30,6 +30,9 @@
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
 #include <linux/io_uring.h>
 #include <atomic>
 #include <type_traits>
@@ -190,10 +193,80 @@ public:
 			TraceEvent("AsyncFileKAIOFStatError").detail("Fd", fd).detail("Filename", filename).GetLastError();
 			return io_error();
 		}
-
 		r->lastFileSize = r->nextFileSize = buf.st_size;
+		if (FLOW_KNOBS->KAIO_ZERO_FILL_GROWTH && (flags & OPEN_READWRITE)) {
+			return writeUnwrittenRanges(r);
+		}
 		return Reference<IAsyncFile>(std::move(r));
 	}
+
+	// Unwritten extents (from fallocate) read as zeros, but each write into one is converted by a filesystem
+	// transaction holding the inode lock exclusively at its completion; meanwhile io_uring's non-blocking attempts on
+	// the file fail and go to io-wq worker threads (libaio waits on the lock instead). Writing zeros over them once, in
+	// large writes, leaves only written extents, which later page-size writes overwrite without a conversion. Done
+	// before the file is handed out, so no other write can overlap.
+	static Future<Reference<IAsyncFile>> writeUnwrittenRanges(Reference<AsyncFileKAIO> self) {
+		for (const auto& [begin, end] : unwrittenRanges(self->fd, self->lastFileSize)) {
+			co_await self->writeZeros(begin, end);
+		}
+		co_return Reference<IAsyncFile>(self);
+	}
+
+	// [begin, end) of the unwritten extents in the first size bytes of fd, 4 KiB aligned.
+	static std::vector<std::pair<int64_t, int64_t>> unwrittenRanges(int fd, int64_t size) {
+		std::vector<std::pair<int64_t, int64_t>> ranges;
+		constexpr int kExtents = 256;
+		std::vector<uint8_t> mem(sizeof(fiemap) + kExtents * sizeof(fiemap_extent));
+		auto* map = reinterpret_cast<fiemap*>(mem.data());
+		uint64_t start = 0;
+		while (start < uint64_t(size)) {
+			memset(mem.data(), 0, mem.size());
+			map->fm_start = start;
+			map->fm_length = uint64_t(size) - start;
+			map->fm_extent_count = kExtents;
+			if (ioctl(fd, FS_IOC_FIEMAP, map) != 0 || map->fm_mapped_extents == 0) {
+				break;
+			}
+			bool last = false;
+			for (uint32_t i = 0; i < map->fm_mapped_extents; i++) {
+				const fiemap_extent& e = map->fm_extents[i];
+				if (e.fe_flags & FIEMAP_EXTENT_UNWRITTEN) {
+					const int64_t b = std::max<int64_t>(e.fe_logical, start) & ~int64_t(4095);
+					const int64_t en = std::min<int64_t>(e.fe_logical + e.fe_length, size) & ~int64_t(4095);
+					if (en > b) {
+						ranges.emplace_back(b, en);
+					}
+				}
+				start = e.fe_logical + e.fe_length;
+				last = last || (e.fe_flags & FIEMAP_EXTENT_LAST);
+			}
+			if (last) {
+				break;
+			}
+		}
+		return ranges;
+	}
+
+	// Writes zeros over [begin, end) (4 KiB aligned) through this file's own I/O path, a few megabytes at a time.
+	Future<Void> writeZeros(int64_t begin, int64_t end) {
+		static uint8_t* zeros = [] {
+			auto* z = static_cast<uint8_t*>(aligned_alloc(4096, kZeroChunk));
+			memset(z, 0, kZeroChunk);
+			return z;
+		}();
+		std::vector<Future<Void>> inFlight;
+		for (int64_t pos = begin; pos < end; pos += kZeroChunk) {
+			const int len = int(std::min<int64_t>(kZeroChunk, end - pos));
+			inFlight.push_back(write(zeros, len, pos));
+			ctx.zeroFilledBytes += len;
+			if (inFlight.size() >= 4) {
+				co_await waitForAll(inFlight);
+				inFlight.clear();
+			}
+		}
+		co_await waitForAll(inFlight);
+	}
+	static constexpr int kZeroChunk = 1 << 20;
 
 	static void init(Reference<IEventFD> ev, double ioTimeout) {
 		ASSERT(!FLOW_KNOBS->DISABLE_POSIX_KERNEL_AIO);
@@ -329,6 +402,9 @@ public:
 #define FALLOC_FL_ZERO_RANGE 0x10
 #endif
 	Future<Void> zeroRange(int64_t offset, int64_t length) override {
+		if (FLOW_KNOBS->KAIO_ZERO_FILL_GROWTH && offset % 4096 == 0 && length % 4096 == 0) {
+			return writeZeros(offset, offset + length); // FALLOC_FL_ZERO_RANGE would leave unwritten extents
+		}
 		bool success = false;
 		if (ctx.fallocateZeroSupported) {
 			int rc = fallocate(fd, FALLOC_FL_ZERO_RANGE, offset, length);
@@ -356,7 +432,14 @@ public:
 		KAIOLogEvent(logFile, id, OpLogEntry::TRUNCATE, OpLogEntry::START, size / 4096);
 		bool completed = false;
 		double begin = timer_monotonic();
-
+		if (FLOW_KNOBS->KAIO_ZERO_FILL_GROWTH && size > lastFileSize && lastFileSize % 4096 == 0 && size % 4096 == 0) {
+			// Grow with written zeros instead of unwritten extents (see writeUnwrittenRanges()). The new size is
+			// recorded first so that launch() does not fallocate ahead of the zero writes.
+			const int64_t from = lastFileSize;
+			lastFileSize = nextFileSize = size;
+			KAIOLogEvent(logFile, id, OpLogEntry::TRUNCATE, OpLogEntry::COMPLETE, size / 4096, 0);
+			return writeZeros(from, size);
+		}
 		if (ctx.fallocateSupported && size >= lastFileSize) {
 			result = fallocate(fd, 0, 0, size);
 			if (result != 0) {
@@ -602,7 +685,7 @@ public:
 	}
 
 	static int64_t getRingCompletions() { return ctx.ringCompletions; }
-	static int64_t getRingTimesTouches() { return ctx.ringTimesTouches; }
+	static int64_t getZeroFilledBytes() { return ctx.zeroFilledBytes; }
 
 	struct SubmitStats {
 		int64_t submitCalls;
@@ -622,24 +705,6 @@ public:
 private:
 	int fd, flags;
 	int64_t lastFileSize, nextFileSize;
-	int64_t lastTimesTouch = 0; // coarse-clock tick of the last touchTimesBeforeRingWrite()
-
-	// io_uring first tries an O_DIRECT write without blocking, and a write that must also update the file's mtime and
-	// ctime cannot be done that way (the update is a filesystem transaction), so it goes to an io-wq worker thread;
-	// libaio does that update inline instead. Setting the times here once per tick of the coarse clock the kernel
-	// stamps them with lets the writes after it in the same tick go straight to the device.
-	void touchTimesBeforeRingWrite() {
-		timespec now;
-		clock_gettime(CLOCK_REALTIME_COARSE, &now);
-		const int64_t tick = now.tv_sec * 1000000000LL + now.tv_nsec;
-		if (tick == lastTimesTouch) {
-			return;
-		}
-		lastTimesTouch = tick;
-		const timespec times[2] = { { 0, UTIME_OMIT }, { 0, UTIME_NOW } };
-		futimens(fd, times);
-		++ctx.ringTimesTouches;
-	}
 	std::string filename;
 	Int64MetricHandle countFileLogicalWrites;
 	Int64MetricHandle countFileLogicalReads;
@@ -768,7 +833,6 @@ private:
 				kind = iouring::Kind::DiskRead;
 				break;
 			case IO_CMD_PWRITE:
-				io->owner->touchTimesBeforeRingWrite();
 				iouring::prepWrite(sqe, io->aio_fildes, io->buf, io->nbytes, io->offset);
 				kind = iouring::Kind::DiskWrite;
 				break;
@@ -950,7 +1014,7 @@ private:
 		int64_t largestSubmittedIOBytes;
 		int64_t largestSubmitBatch;
 		int64_t ringCompletions = 0;
-		int64_t ringTimesTouches = 0;
+		int64_t zeroFilledBytes = 0;
 		Context()
 		  : iocx(0), evfd(-1), outstanding(0), ioStallBegin(0), fallocateSupported(true), fallocateZeroSupported(true),
 		    fdsyncSupported(true), fdsyncSubmitted(0), fdsyncFallbacks(0), submittedRequestList(nullptr), opsIssued(0),

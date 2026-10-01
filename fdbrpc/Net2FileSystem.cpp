@@ -460,7 +460,6 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
 		std::vector<uint8_t> expected(static_cast<size_t>(slots) * blockBytes);
 		const iouring::Stats before = ring->stats();
 		const int64_t completionsBefore = AsyncFileKAIO::getRingCompletions();
-		const int64_t touchesBefore = AsyncFileKAIO::getRingTimesTouches();
 		int reads = 0, writes = 0, syncs = 0, mostWorkers = 0;
 		for (int round = 0; round < rounds; round++) {
 			// Every slot written concurrently, then synced, then all read back concurrently.
@@ -501,18 +500,14 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
 		ASSERT_EQ(submitted(iouring::Kind::DiskFsync), syncs);
 		ASSERT_EQ(completed(iouring::Kind::DiskFsync), syncs);
 		ASSERT_EQ(AsyncFileKAIO::getRingCompletions() - completionsBefore, reads + writes + syncs);
-		// Each burst of writes refreshed the file's times first (at most once per clock tick), and the io-wq workers
-		// that run what cannot be done without blocking stayed within the cap.
-		const int64_t touches = AsyncFileKAIO::getRingTimesTouches() - touchesBefore;
-		ASSERT(touches >= 1 && touches <= writes);
+		// io-wq workers (what cannot be done without blocking, such as fsync) stayed within the cap.
 		ASSERT_LE(mostWorkers, FLOW_KNOBS->IO_URING_MAX_WORKERS);
-		printf("KAIO io_uring: %d writes, %d reads, %d syncs through the ring, data verified; %lld time touches, at "
-		       "most %d io-wq workers\n",
-		       writes,
-		       reads,
-		       syncs,
-		       (long long)touches,
-		       mostWorkers);
+		printf(
+		    "KAIO io_uring: %d writes, %d reads, %d syncs through the ring, data verified; at most %d io-wq workers\n",
+		    writes,
+		    reads,
+		    syncs,
+		    mostWorkers);
 	} catch (Error& e) {
 		err = e;
 	}
@@ -523,6 +518,113 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
 	if (f) {
 		co_await AsyncFileEIO::deleteFile(filename, true);
 	}
+	if (err.present()) {
+		throw err.get();
+	}
+}
+
+// With KAIO_ZERO_FILL_GROWTH a KAIO file has no unwritten extents: those already in the file are written with zeros
+// at open (keeping any data), growth writes zeros instead of fallocating, and zeroRange writes zeros. Without the
+// knob, growth leaves unwritten extents (where the filesystem has them, which makes the rest meaningful).
+TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillGrowth") {
+	if (g_network->isSimulated()) {
+		co_return;
+	}
+	auto* knobs = const_cast<FlowKnobs*>(FLOW_KNOBS);
+	const bool savedZeroFill = knobs->KAIO_ZERO_FILL_GROWTH;
+	const bool savedRing = knobs->KAIO_IO_URING;
+	knobs->KAIO_IO_URING = true;
+	constexpr int64_t MB = 1 << 20;
+	const std::string filename =
+	    joinPath(params.getDataDir(),
+	             format("__KAIO_ZERO_FILL_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str()));
+	uint8_t* page = static_cast<uint8_t*>(allocateFast4kAligned(4096));
+	Reference<IAsyncFile> f;
+	Optional<Error> err;
+	auto unwritten = [&](int64_t size) {
+		const int fd = ::open(filename.c_str(), O_RDONLY | O_CLOEXEC);
+		auto r = AsyncFileKAIO::unwrittenRanges(fd, size);
+		::close(fd);
+		int64_t bytes = 0;
+		for (const auto& [b, e] : r) {
+			bytes += e - b;
+		}
+		return bytes;
+	};
+	auto readPage = [&](int64_t offset) -> Future<Void> {
+		memset(page, 0x5a, 4096);
+		const int n = co_await f->read(page, 4096, offset);
+		ASSERT_EQ(n, 4096);
+	};
+	try {
+		// A file with 8 MB fallocated (unwritten) and one written page of data at 1 MB.
+		{
+			const int fd = ::open(filename.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+			ASSERT(fd >= 0 && fallocate(fd, 0, 0, 8 * MB) == 0);
+			std::vector<uint8_t> data(4096);
+			for (int i = 0; i < 4096; i++) {
+				data[i] = uint8_t(i * 7 + 3);
+			}
+			ASSERT(pwrite(fd, data.data(), 4096, MB) == 4096 && fsync(fd) == 0);
+			::close(fd);
+		}
+		const int64_t before = unwritten(8 * MB);
+		if (before == 0) {
+			printf("KAIO zero fill: the filesystem reports no unwritten extents; nothing to check\n");
+		} else {
+			knobs->KAIO_ZERO_FILL_GROWTH = true;
+			const int64_t filledBefore = AsyncFileKAIO::getZeroFilledBytes();
+			f = co_await AsyncFileKAIO::open(
+			    filename, IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE, 0644, nullptr);
+			ASSERT_EQ(unwritten(8 * MB), 0);
+			co_await readPage(MB);
+			for (int i = 0; i < 4096; i++) {
+				ASSERT_EQ(page[i], uint8_t(i * 7 + 3));
+			}
+			for (int64_t at : { int64_t(0), 4 * MB, 8 * MB - 4096 }) {
+				co_await readPage(at);
+				for (int i = 0; i < 4096; i++) {
+					ASSERT_EQ(page[i], 0);
+				}
+			}
+			// Growth writes zeros.
+			co_await f->truncate(16 * MB);
+			ASSERT_EQ(unwritten(16 * MB), 0);
+			ASSERT_EQ(fileSize(filename), 16 * MB);
+			co_await readPage(12 * MB);
+			for (int i = 0; i < 4096; i++) {
+				ASSERT_EQ(page[i], 0);
+			}
+			// zeroRange writes zeros over data.
+			memset(page, 0xab, 4096);
+			co_await f->write(page, 4096, 2 * MB);
+			co_await f->zeroRange(2 * MB, 2 * MB);
+			co_await readPage(2 * MB);
+			for (int i = 0; i < 4096; i++) {
+				ASSERT_EQ(page[i], 0);
+			}
+			ASSERT_EQ(unwritten(16 * MB), 0);
+			const int64_t filled = AsyncFileKAIO::getZeroFilledBytes() - filledBefore;
+			ASSERT(filled >= before + 8 * MB);
+			// Without the knob, growth fallocates again.
+			knobs->KAIO_ZERO_FILL_GROWTH = false;
+			co_await f->truncate(24 * MB);
+			const int64_t after = unwritten(24 * MB);
+			ASSERT_GT(after, 0);
+			printf("KAIO zero fill: %lld unwritten bytes written at open, growth and zeroRange wrote %lld zero bytes, "
+			       "%lld unwritten bytes after growth without the knob\n",
+			       (long long)before,
+			       (long long)filled,
+			       (long long)after);
+		}
+	} catch (Error& e) {
+		err = e;
+	}
+	knobs->KAIO_ZERO_FILL_GROWTH = savedZeroFill;
+	knobs->KAIO_IO_URING = savedRing;
+	freeFast4kAligned(4096, page);
+	f.clear();
+	co_await AsyncFileEIO::deleteFile(filename, true);
 	if (err.present()) {
 		throw err.get();
 	}
