@@ -66,6 +66,7 @@
 #define IORING_SETUP_NO_SQARRAY (1U << 16)
 #endif
 constexpr unsigned kRegisterPbufRing = 22; // IORING_REGISTER_PBUF_RING (5.19)
+constexpr unsigned kRegisterIowqMaxWorkers = 19; // IORING_REGISTER_IOWQ_MAX_WORKERS (5.15)
 constexpr uint16_t kRecvMultishot = 1U << 1; // IORING_RECV_MULTISHOT (6.0)
 constexpr uint16_t kAcceptMultishot = 1U << 0; // IORING_ACCEPT_MULTISHOT (5.19)
 constexpr uint32_t kCancelAll = 1U << 0; // IORING_ASYNC_CANCEL_ALL (5.19)
@@ -227,6 +228,11 @@ bool Ring::init(unsigned entries) {
 	} else {
 		enterFd = fd;
 	}
+	// Operations that cannot complete without blocking (fsync, and file I/O the filesystem would block on) run on
+	// io-wq worker threads, which otherwise multiply under a burst of them.
+	unsigned maxWorkers[2] = { unsigned(std::max(FLOW_KNOBS->IO_URING_MAX_WORKERS, 1)),
+		                       unsigned(std::max(FLOW_KNOBS->IO_URING_MAX_WORKERS, 1)) };
+	const bool workersCapped = syscall(__NR_io_uring_register, fd, kRegisterIowqMaxWorkers, maxWorkers, 2) == 0;
 	// Multishot receives and buffer rings predate DEFER_TASKRUN (6.0, 5.19), so its acceptance implies both.
 	if (deferTaskrun && FLOW_KNOBS->NET_IO_URING_MULTISHOT) {
 		initBufferRing();
@@ -238,6 +244,7 @@ bool Ring::init(unsigned entries) {
 	    .detail("SetupFlags", setupFlags)
 	    .detail("DeferTaskrun", deferTaskrun)
 	    .detail("RegisteredRing", enterFlags != 0)
+	    .detail("MaxWorkers", workersCapped ? FLOW_KNOBS->IO_URING_MAX_WORKERS : 0)
 	    .detail("RecvBuffers", bufCount)
 	    .detail("RecvBufferBytes", bufSize);
 	return true;

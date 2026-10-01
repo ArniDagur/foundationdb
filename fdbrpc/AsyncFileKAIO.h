@@ -602,6 +602,7 @@ public:
 	}
 
 	static int64_t getRingCompletions() { return ctx.ringCompletions; }
+	static int64_t getRingTimesTouches() { return ctx.ringTimesTouches; }
 
 	struct SubmitStats {
 		int64_t submitCalls;
@@ -621,6 +622,24 @@ public:
 private:
 	int fd, flags;
 	int64_t lastFileSize, nextFileSize;
+	int64_t lastTimesTouch = 0; // coarse-clock tick of the last touchTimesBeforeRingWrite()
+
+	// io_uring first tries an O_DIRECT write without blocking, and a write that must also update the file's mtime and
+	// ctime cannot be done that way (the update is a filesystem transaction), so it goes to an io-wq worker thread;
+	// libaio does that update inline instead. Setting the times here once per tick of the coarse clock the kernel
+	// stamps them with lets the writes after it in the same tick go straight to the device.
+	void touchTimesBeforeRingWrite() {
+		timespec now;
+		clock_gettime(CLOCK_REALTIME_COARSE, &now);
+		const int64_t tick = now.tv_sec * 1000000000LL + now.tv_nsec;
+		if (tick == lastTimesTouch) {
+			return;
+		}
+		lastTimesTouch = tick;
+		const timespec times[2] = { { 0, UTIME_OMIT }, { 0, UTIME_NOW } };
+		futimens(fd, times);
+		++ctx.ringTimesTouches;
+	}
 	std::string filename;
 	Int64MetricHandle countFileLogicalWrites;
 	Int64MetricHandle countFileLogicalReads;
@@ -749,6 +768,7 @@ private:
 				kind = iouring::Kind::DiskRead;
 				break;
 			case IO_CMD_PWRITE:
+				io->owner->touchTimesBeforeRingWrite();
 				iouring::prepWrite(sqe, io->aio_fildes, io->buf, io->nbytes, io->offset);
 				kind = iouring::Kind::DiskWrite;
 				break;
@@ -930,6 +950,7 @@ private:
 		int64_t largestSubmittedIOBytes;
 		int64_t largestSubmitBatch;
 		int64_t ringCompletions = 0;
+		int64_t ringTimesTouches = 0;
 		Context()
 		  : iocx(0), evfd(-1), outstanding(0), ioStallBegin(0), fallocateSupported(true), fallocateZeroSupported(true),
 		    fdsyncSupported(true), fdsyncSubmitted(0), fdsyncFallbacks(0), submittedRequestList(nullptr), opsIssued(0),

@@ -246,6 +246,7 @@ public:
 	bool NET_IO_URING_MULTISHOT; // multishot receives into provided buffers where the kernel has them, else one
 	                             // receive per connection into its own buffer
 	int NET_IO_URING_MAX_QUEUED_BYTES; // a connection's multishot receive pauses while this much of its data is unread
+	int IO_URING_MAX_WORKERS; // cap on io-wq worker threads per kind (bounded, unbounded) of the ring
 	double IO_URING_METRICS_INTERVAL; // seconds between IoUringMetrics trace events
 
 	int NETWORK_TEST_CLIENT_COUNT;

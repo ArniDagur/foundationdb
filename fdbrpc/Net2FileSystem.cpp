@@ -43,6 +43,9 @@
 #include "AsyncFileWriteChecker.h"
 #include "flow/UnitTest.h"
 #include "flow/IoUring.h"
+#ifdef __linux__
+#include <dirent.h>
+#endif
 
 #ifdef __linux__
 namespace {
@@ -406,6 +409,26 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/SplitRandomIO") {
 // With KAIO_IO_URING, reads, writes and syncs must complete through the network thread's io_uring (the ring's disk
 // counters and KAIO's ring completions grow by exactly the requests made) and read back what was written, with many
 // requests in flight at once.
+// io-wq worker threads of this process (named iou-wrk-<pid>).
+static int ioWorkerThreads() {
+	int n = 0;
+	DIR* dir = opendir("/proc/self/task");
+	while (dirent* e = dir ? readdir(dir) : nullptr) {
+		char comm[32] = {};
+		FILE* f = std::fopen((std::string("/proc/self/task/") + e->d_name + "/comm").c_str(), "r");
+		if (f && std::fgets(comm, sizeof(comm), f) && std::strncmp(comm, "iou-wrk", 7) == 0) {
+			++n;
+		}
+		if (f) {
+			std::fclose(f);
+		}
+	}
+	if (dir) {
+		closedir(dir);
+	}
+	return n;
+}
+
 TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
 	if (g_network->isSimulated()) {
 		co_return;
@@ -437,7 +460,8 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
 		std::vector<uint8_t> expected(static_cast<size_t>(slots) * blockBytes);
 		const iouring::Stats before = ring->stats();
 		const int64_t completionsBefore = AsyncFileKAIO::getRingCompletions();
-		int reads = 0, writes = 0, syncs = 0;
+		const int64_t touchesBefore = AsyncFileKAIO::getRingTimesTouches();
+		int reads = 0, writes = 0, syncs = 0, mostWorkers = 0;
 		for (int round = 0; round < rounds; round++) {
 			// Every slot written concurrently, then synced, then all read back concurrently.
 			std::vector<Future<Void>> pending;
@@ -450,6 +474,7 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
 				++writes;
 			}
 			co_await waitForAll(pending);
+			mostWorkers = std::max(mostWorkers, ioWorkerThreads());
 			co_await f->sync();
 			++syncs;
 			for (int slot = 0; slot < slots; slot++) {
@@ -476,7 +501,18 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/IoUring") {
 		ASSERT_EQ(submitted(iouring::Kind::DiskFsync), syncs);
 		ASSERT_EQ(completed(iouring::Kind::DiskFsync), syncs);
 		ASSERT_EQ(AsyncFileKAIO::getRingCompletions() - completionsBefore, reads + writes + syncs);
-		printf("KAIO io_uring: %d writes, %d reads, %d syncs through the ring, data verified\n", writes, reads, syncs);
+		// Each burst of writes refreshed the file's times first (at most once per clock tick), and the io-wq workers
+		// that run what cannot be done without blocking stayed within the cap.
+		const int64_t touches = AsyncFileKAIO::getRingTimesTouches() - touchesBefore;
+		ASSERT(touches >= 1 && touches <= writes);
+		ASSERT_LE(mostWorkers, FLOW_KNOBS->IO_URING_MAX_WORKERS);
+		printf("KAIO io_uring: %d writes, %d reads, %d syncs through the ring, data verified; %lld time touches, at "
+		       "most %d io-wq workers\n",
+		       writes,
+		       reads,
+		       syncs,
+		       (long long)touches,
+		       mostWorkers);
 	} catch (Error& e) {
 		err = e;
 	}
