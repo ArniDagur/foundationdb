@@ -872,8 +872,9 @@ public:
 		}
 		waiter = Promise<int>();
 		waiting = true;
+		Future<int> f = waiter.getFuture(); // before arm(), which only arms a single-shot accept for a waiter
 		arm();
-		return waiter.getFuture();
+		return f;
 	}
 
 	// Must run before the listening descriptor is closed.
