@@ -2808,41 +2808,46 @@ void Net2::run() {
 
 #if defined(__linux__)
 		if (FLOW_KNOBS->RUN_LOOP_PROFILING_INTERVAL > 0) {
-			sigset_t orig_set;
-			pthread_sigmask(SIG_BLOCK, &sigprof_set, &orig_set);
+			// The SIGPROF handler runs on this thread and increments net2backtraces_count before it touches anything
+			// else, so a zero count means there is nothing to harvest, and the signal mask need not change on every
+			// iteration.
+			if (net2backtraces_count != 0) {
+				sigset_t orig_set;
+				pthread_sigmask(SIG_BLOCK, &sigprof_set, &orig_set);
 
-			size_t other_offset = net2backtraces_offset;
-			bool was_overflow = net2backtraces_overflow;
-			int signal_count = net2backtraces_count;
+				size_t other_offset = net2backtraces_offset;
+				bool was_overflow = net2backtraces_overflow;
+				int signal_count = net2backtraces_count;
 
-			countRunLoopProfilingSignals += signal_count;
+				countRunLoopProfilingSignals += signal_count;
 
-			if (other_offset) {
-				volatile void** _traces = net2backtraces;
-				net2backtraces = other_backtraces;
-				other_backtraces = _traces;
+				if (other_offset) {
+					volatile void** _traces = net2backtraces;
+					net2backtraces = other_backtraces;
+					other_backtraces = _traces;
 
-				net2backtraces_offset = 0;
-			}
+					net2backtraces_offset = 0;
+				}
 
-			net2backtraces_overflow = false;
-			net2backtraces_count = 0;
+				net2backtraces_overflow = false;
+				net2backtraces_count = 0;
 
-			pthread_sigmask(SIG_SETMASK, &orig_set, nullptr);
+				pthread_sigmask(SIG_SETMASK, &orig_set, nullptr);
 
-			if (was_overflow) {
-				TraceEvent("Net2RunLoopProfilerOverflow")
-				    .detail("SignalsReceived", signal_count)
-				    .detail("BackTraceHarvested", other_offset != 0);
-			}
-			if (other_offset) {
-				size_t iter_offset = 0;
-				while (iter_offset < other_offset) {
-					auto* ps = (ProfilingSample*)(other_backtraces + iter_offset);
-					TraceEvent(SevWarn, "Net2RunLoopTrace")
-					    .detailf("TraceTime", "%.6f", ps->timestamp)
-					    .detail("Trace", platform::format_backtrace(ps->frames, ps->length));
-					iter_offset += ps->length + 2;
+				if (was_overflow) {
+					TraceEvent("Net2RunLoopProfilerOverflow")
+					    .detail("SignalsReceived", signal_count)
+					    .detail("BackTraceHarvested", other_offset != 0);
+				}
+				if (other_offset) {
+					size_t iter_offset = 0;
+					while (iter_offset < other_offset) {
+						auto* ps = (ProfilingSample*)(other_backtraces + iter_offset);
+						TraceEvent(SevWarn, "Net2RunLoopTrace")
+						    .detailf("TraceTime", "%.6f", ps->timestamp)
+						    .detail("Trace", platform::format_backtrace(ps->frames, ps->length));
+						iter_offset += ps->length + 2;
+					}
 				}
 			}
 
