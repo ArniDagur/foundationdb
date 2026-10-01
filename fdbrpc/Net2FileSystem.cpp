@@ -643,6 +643,57 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillGrowth") {
 		throw err.get();
 	}
 }
+// With KAIO_CLEAR_SETGID, opening a KAIO file read-write clears a set-group-ID bit that has no group execute (and
+// leaves the rest of the mode); without the knob the mode is left alone.
+TEST_CASE("/fdbrpc/AsyncFileKAIO/ClearSetGID") {
+	if (g_network->isSimulated()) {
+		co_return;
+	}
+	auto* knobs = const_cast<FlowKnobs*>(FLOW_KNOBS);
+	const bool saved = knobs->KAIO_CLEAR_SETGID;
+	const std::string filename =
+	    joinPath(params.getDataDir(),
+	             format("__KAIO_SETGID_TEST_%s__", deterministicRandom()->randomUniqueID().toString().c_str()));
+	auto mode = [&]() {
+		struct stat st;
+		ASSERT(stat(filename.c_str(), &st) == 0);
+		return st.st_mode & 07777;
+	};
+	Optional<Error> err;
+	try {
+		const int fd = ::open(filename.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+		ASSERT(fd >= 0 && fchmod(fd, 02664) == 0);
+		::close(fd);
+		knobs->KAIO_CLEAR_SETGID = false;
+		{
+			Reference<IAsyncFile> f = co_await AsyncFileKAIO::open(
+			    filename, IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE, 0644, nullptr);
+		}
+		ASSERT_EQ(mode(), 02664);
+		knobs->KAIO_CLEAR_SETGID = true;
+		{
+			Reference<IAsyncFile> f = co_await AsyncFileKAIO::open(
+			    filename, IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE, 0644, nullptr);
+		}
+		ASSERT_EQ(mode(), 0664);
+		// With group execute the bit means something; it stays.
+		ASSERT(chmod(filename.c_str(), 02674) == 0);
+		{
+			Reference<IAsyncFile> f = co_await AsyncFileKAIO::open(
+			    filename, IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE, 0644, nullptr);
+		}
+		ASSERT_EQ(mode(), 02674);
+		printf("KAIO set-group-ID: cleared on open with the knob (02664 -> 0664), kept without it and with group "
+		       "execute\n");
+	} catch (Error& e) {
+		err = e;
+	}
+	knobs->KAIO_CLEAR_SETGID = saved;
+	co_await AsyncFileEIO::deleteFile(filename, true);
+	if (err.present()) {
+		throw err.get();
+	}
+}
 #endif // __linux__
 
 // Opens a file for asynchronous I/O

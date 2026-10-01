@@ -241,6 +241,7 @@ public:
 	// Proof of concept: KAIO reads, writes and fsyncs go through the network thread's io_uring instead of libaio.
 	bool KAIO_IO_URING;
 	bool KAIO_ZERO_FILL_GROWTH; // KAIO files grow with written zeros, and unwritten ranges are written at open
+	bool KAIO_CLEAR_SETGID; // clear a set-group-ID bit without group execute on KAIO files opened read-write
 	int IO_URING_ENTRIES; // submission queue entries of the network thread's io_uring
 	int NET_IO_URING_RECV_BYTES; // size of each NET_IO_URING receive buffer
 	int NET_IO_URING_RECV_BUFFERS; // provided receive buffers shared by all connections (multishot receives)

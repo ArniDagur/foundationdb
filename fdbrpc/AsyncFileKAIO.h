@@ -196,6 +196,17 @@ public:
 		}
 		r->lastFileSize = r->nextFileSize = buf.st_size;
 		r->inode = { buf.st_dev, buf.st_ino };
+		if (FLOW_KNOBS->KAIO_CLEAR_SETGID && (flags & OPEN_READWRITE) && S_ISREG(buf.st_mode) &&
+		    (buf.st_mode & S_ISGID) && !(buf.st_mode & S_IXGRP)) {
+			// A set-group-ID bit (here without group execute, as files get on volumes Kubernetes changes to a pod's
+			// fsGroup) keeps the kernel from marking the inode as having no privileges to drop, so XFS takes the
+			// inode lock exclusively for every direct write to check. Under load that lock is nearly always held, so
+			// io_uring's non-blocking attempts at reads and writes fail and go to io-wq worker threads; libaio
+			// waits for it. Without group execute the bit has no meaning for a regular file.
+			if (fchmod(fd, buf.st_mode & 07777 & ~S_ISGID) == 0) {
+				TraceEvent("AsyncFileKAIOClearedSetGID").detail("Filename", filename);
+			}
+		}
 		++openHandles()[r->inode];
 		if ((flags & OPEN_READWRITE) && r->mayZeroFill()) {
 			return writeUnwrittenRanges(r);
