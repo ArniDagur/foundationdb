@@ -1039,6 +1039,8 @@ public:
 	double TLOG_MIN_AVAILABLE_SPACE_RATIO;
 	bool TLOG_DISK_SPACE_CHECK_CACHE; // low-disk admission reuses disk-space samples and skips them when disabled
 	double TLOG_DISK_SPACE_CHECK_INTERVAL; // maximum age of a reused disk-space sample, in seconds
+	int CONFIRM_EPOCH_LIVE_SPARE_TLOGS; // TLogs asked beyond a policy-satisfying set to confirm an epoch; <0: all
+	double CONFIRM_EPOCH_LIVE_HEDGE_DELAY; // seconds before the remaining TLogs are asked as well
 	int64_t TLOG_RECOVER_MEMORY_LIMIT;
 	double TLOG_IGNORE_POP_AUTO_ENABLE_DELAY;
 

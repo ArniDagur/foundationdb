@@ -1115,6 +1115,8 @@ void ServerKnobs::initialize(Randomize randomize, ClientKnobs* clientKnobs, IsSi
 	init( TLOG_MIN_AVAILABLE_SPACE_RATIO,                        0.0 ); if( randomize && buggify() ) TLOG_MIN_AVAILABLE_SPACE_RATIO = 0.1;
 	init( TLOG_DISK_SPACE_CHECK_CACHE,                        false ); if( randomize && buggify() ) TLOG_DISK_SPACE_CHECK_CACHE = true;
 	init( TLOG_DISK_SPACE_CHECK_INTERVAL,                        1.0 ); if( randomize && buggify() ) TLOG_DISK_SPACE_CHECK_INTERVAL = deterministicRandom()->random01();
+	init( CONFIRM_EPOCH_LIVE_SPARE_TLOGS,                         -1 ); if( randomize && buggify() ) CONFIRM_EPOCH_LIVE_SPARE_TLOGS = deterministicRandom()->randomInt(0, 3);
+	init( CONFIRM_EPOCH_LIVE_HEDGE_DELAY,                      0.005 ); if( randomize && buggify() ) CONFIRM_EPOCH_LIVE_HEDGE_DELAY = deterministicRandom()->random01() * 0.01;
 	init( TLOG_RECOVER_MEMORY_LIMIT, TARGET_BYTES_PER_TLOG + SPRING_BYTES_TLOG );
 
 	init( MAX_TRANSACTIONS_PER_BYTE,                            1000 );

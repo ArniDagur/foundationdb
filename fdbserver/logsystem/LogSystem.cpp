@@ -184,6 +184,10 @@ void LogPushData::setMutations(uint32_t totalMutations, VectorRef<StringRef> mut
 #include "fdbserver/core/WaitFailure.h"
 
 #include "flow/CoroUtils.h"
+#include "flow/UnitTest.h"
+
+#include <deque>
+#include <numeric>
 
 namespace {
 
@@ -1110,47 +1114,93 @@ void LogSystem::updateLogRouter(int logSetIndex, int tagId, TLogInterface const&
 }
 
 Future<Void> LogSystem::confirmEpochLive_internal(Reference<LogSet> logSet, Optional<UID> debugID) {
-	std::vector<Future<Void>> alive;
+	const int n = logSet->logServers.size();
 	int numPresent = 0;
 	for (auto& t : logSet->logServers) {
-		if (t->get().present()) {
-			alive.push_back(brokenPromiseToNever(t->get().interf().confirmRunning.getReply(
-			    TLogConfirmRunningRequest(debugID), TaskPriority::TLogConfirmRunningReply)));
-			numPresent++;
-		} else {
-			alive.push_back(Never());
+		numPresent += t->get().present();
+	}
+	const int required = std::min(logSet->tLogReplicationFactor, numPresent - logSet->tLogWriteAntiQuorum);
+
+	std::vector<Future<Void>> alive(n);
+	std::vector<bool> asked(n, false);
+	int numAsked = 0;
+	auto ask = [&](int i) {
+		auto& t = logSet->logServers[i];
+		alive[i] = t->get().present() ? brokenPromiseToNever(t->get().interf().confirmRunning.getReply(
+		                                    TLogConfirmRunningRequest(debugID), TaskPriority::TLogConfirmRunningReply))
+		                              : Future<Void>(Never());
+		asked[i] = true;
+		++numAsked;
+	};
+	auto askRest = [&]() {
+		for (int i = 0; i < n; i++) {
+			if (!asked[i]) {
+				ask(i);
+			}
+		}
+	};
+
+	const int spare = SERVER_KNOBS->CONFIRM_EPOCH_LIVE_SPARE_TLOGS;
+	if (spare < 0 || required + spare >= numPresent) {
+		askRest();
+	} else {
+		// Every GRV batch confirms the epoch, so asking all TLogs dominates the confirmation's cost on both sides.
+		// Ask a policy-satisfying set from a random starting TLog plus `spare` more; the rest are asked only if those
+		// do not confirm within CONFIRM_EPOCH_LIVE_HEDGE_DELAY. The completion condition below is unchanged.
+		const int start = deterministicRandom()->randomInt(0, n);
+		std::vector<LocalityEntry> askedEntries;
+		int extra = 0;
+		for (int k = 0; k < n; k++) {
+			const int i = (start + k) % n;
+			if (!logSet->logServers[i]->get().present()) {
+				continue;
+			}
+			const bool satisfied = (int)askedEntries.size() >= required && logSet->satisfiesPolicy(askedEntries);
+			if (satisfied && extra >= spare) {
+				break;
+			}
+			ask(i);
+			askedEntries.push_back(logSet->getLogEntry(i));
+			extra += satisfied;
 		}
 	}
-
-	co_await quorum(alive, std::min(logSet->tLogReplicationFactor, numPresent - logSet->tLogWriteAntiQuorum));
+	Future<Void> hedge = numAsked < n ? delay(SERVER_KNOBS->CONFIRM_EPOCH_LIVE_HEDGE_DELAY) : Never();
 
 	std::vector<LocalityEntry> aliveEntries;
-	std::vector<bool> responded(alive.size(), false);
+	std::vector<bool> responded(n, false);
 	while (true) {
-		for (int i = 0; i < alive.size(); i++) {
-			if (!responded[i] && alive[i].isReady() && !alive[i].isError()) {
+		for (int i = 0; i < n; i++) {
+			if (asked[i] && !responded[i] && alive[i].isReady() && !alive[i].isError()) {
 				aliveEntries.push_back(logSet->getLogEntry(i));
 				responded[i] = true;
 			}
 		}
 
-		if (logSet->satisfiesPolicy(aliveEntries)) {
+		if ((int)aliveEntries.size() >= required && logSet->satisfiesPolicy(aliveEntries)) {
 			co_return;
 		}
 
 		// The current set of responders that we have weren't enough to form a quorum, so we must
 		// wait for more responses and try again.
 		std::vector<Future<Void>> changes;
-		for (int i = 0; i < alive.size(); i++) {
+		for (int i = 0; i < n; i++) {
+			if (!asked[i]) {
+				continue;
+			}
 			if (!alive[i].isReady()) {
 				changes.push_back(ready(alive[i]));
-			} else if (alive[i].isReady() && alive[i].isError() &&
-			           alive[i].getError().code() == error_code_tlog_stopped) {
+			} else if (alive[i].isError() && alive[i].getError().code() == error_code_tlog_stopped) {
 				// All commits must go to all TLogs.  If any TLog is stopped, then our epoch has ended.
 				co_await Future<Void>(Never());
 			}
 		}
+		if (numAsked < n && (changes.empty() || hedge.isReady())) {
+			askRest();
+			hedge = Never();
+			continue;
+		}
 		ASSERT(!changes.empty());
+		changes.push_back(hedge);
 		co_await waitForAny(changes);
 	}
 }
@@ -3193,4 +3243,119 @@ Future<Void> LogSystem::trackTLogRecoveryActor(std::vector<Reference<AsyncVar<Op
 		TraceEvent("TLogRecoveredVersion").detail("RecoveredVersion", currentRecoveredVersion);
 		recoveredVersion->set(currentRecoveredVersion);
 	}
+}
+
+namespace {
+
+// Answers (or, when `answer` is false, drops) every confirmRunning request a TLog interface receives, counting them.
+Future<Void> serveConfirmRunning(TLogInterface tli, int* requests, const bool* answer) {
+	while (true) {
+		TLogConfirmRunningRequest req = co_await tli.confirmRunning.getFuture();
+		++*requests;
+		if (*answer) {
+			req.reply.send(Void());
+		}
+	}
+}
+
+// A log set of `zones` x `perZone` local TLog interfaces replicated across 2 zones.
+class ConfirmEpochLiveFixture : NonCopyable {
+public:
+	ConfirmEpochLiveFixture(int zones, int perZone, int spare, double hedgeDelay)
+	  : savedSpare(SERVER_KNOBS->CONFIRM_EPOCH_LIVE_SPARE_TLOGS),
+	    savedHedgeDelay(SERVER_KNOBS->CONFIRM_EPOCH_LIVE_HEDGE_DELAY), logSet(makeReference<LogSet>()),
+	    requests(zones * perZone, 0), answers(zones * perZone, true) {
+		auto* knobs = const_cast<ServerKnobs*>(SERVER_KNOBS);
+		knobs->CONFIRM_EPOCH_LIVE_SPARE_TLOGS = spare;
+		knobs->CONFIRM_EPOCH_LIVE_HEDGE_DELAY = hedgeDelay;
+		logSet->tLogReplicationFactor = 2;
+		logSet->tLogPolicy = makeReference<PolicyAcross>(2, "zoneid", makeReference<PolicyOne>());
+		for (int z = 0; z < zones; z++) {
+			for (int j = 0; j < perZone; j++) {
+				Standalone<StringRef> zone(format("zone-%d", z));
+				Standalone<StringRef> machine(format("machine-%d-%d", z, j));
+				LocalityData locality(machine, zone, machine, "dc"_sr);
+				TLogInterface tli(locality);
+				logSet->logServers.push_back(
+				    makeReference<AsyncVar<OptionalInterface<TLogInterface>>>(OptionalInterface<TLogInterface>(tli)));
+				logSet->tLogLocalities.push_back(locality);
+				tlogs.push_back(tli);
+			}
+		}
+		logSet->updateLocalitySet(logSet->tLogLocalities);
+	}
+
+	~ConfirmEpochLiveFixture() {
+		auto* knobs = const_cast<ServerKnobs*>(SERVER_KNOBS);
+		knobs->CONFIRM_EPOCH_LIVE_SPARE_TLOGS = savedSpare;
+		knobs->CONFIRM_EPOCH_LIVE_HEDGE_DELAY = savedHedgeDelay;
+	}
+
+	void serve() {
+		for (int i = 0; i < tlogs.size(); i++) {
+			servers.push_back(serveConfirmRunning(tlogs[i], &requests[i], &answers[i]));
+		}
+	}
+
+	int totalRequests() const { return std::accumulate(requests.begin(), requests.end(), 0); }
+
+	const int savedSpare;
+	const double savedHedgeDelay;
+	Reference<LogSet> logSet;
+	std::vector<TLogInterface> tlogs;
+	std::vector<int> requests;
+	std::deque<bool> answers;
+	std::vector<Future<Void>> servers;
+};
+
+} // namespace
+
+TEST_CASE("/fdbserver/logsystem/ConfirmEpochLive/AsksAllByDefault") {
+	ConfirmEpochLiveFixture f(3, 5, -1, 1.0);
+	f.serve();
+	co_await LogSystem::confirmEpochLive_internal(f.logSet, Optional<UID>());
+	co_await delay(0.01);
+	ASSERT_EQ(f.totalRequests(), 15);
+}
+
+TEST_CASE("/fdbserver/logsystem/ConfirmEpochLive/AsksPolicySubsetPlusSpare") {
+	for (int spare = 0; spare <= 2; spare++) {
+		ConfirmEpochLiveFixture f(3, 5, spare, 1.0);
+		f.serve();
+		co_await LogSystem::confirmEpochLive_internal(f.logSet, Optional<UID>());
+		co_await delay(0.01);
+		// Two TLogs in distinct zones satisfy the policy; with 5 TLogs per zone that takes 2 to 6 asks from a random
+		// start, plus the spares.
+		ASSERT_GE(f.totalRequests(), 2 + spare);
+		ASSERT_LE(f.totalRequests(), 6 + spare);
+		ASSERT_LT(f.totalRequests(), 15);
+	}
+}
+
+TEST_CASE("/fdbserver/logsystem/ConfirmEpochLive/HedgesToRemainingTLogs") {
+	// Only zone 0's TLogs and TLog 9 (zone 1) answer. The initially asked run of consecutive TLogs never holds both a
+	// zone-0 TLog and TLog 9, so only the hedge to the remaining TLogs can complete the confirmation.
+	ConfirmEpochLiveFixture f(3, 5, 1, 0.05);
+	for (int i = 0; i < 15; i++) {
+		f.answers[i] = i < 5 || i == 9;
+	}
+	f.serve();
+	const double start = now();
+	co_await LogSystem::confirmEpochLive_internal(f.logSet, Optional<UID>());
+	co_await delay(0.01);
+	ASSERT_EQ(f.totalRequests(), 15);
+	ASSERT_GE(now() - start, 0.05);
+}
+
+TEST_CASE("/fdbserver/logsystem/ConfirmEpochLive/WaitsForPolicy") {
+	// Replies from one zone alone never satisfy a 2-zone policy, hedged or not.
+	ConfirmEpochLiveFixture f(3, 5, 1, 0.01);
+	for (int i = 0; i < 15; i++) {
+		f.answers[i] = i < 5;
+	}
+	f.serve();
+	Future<Void> confirmed = LogSystem::confirmEpochLive_internal(f.logSet, Optional<UID>());
+	co_await delay(0.2);
+	ASSERT(!confirmed.isReady());
+	ASSERT_EQ(f.totalRequests(), 15);
 }
