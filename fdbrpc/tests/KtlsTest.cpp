@@ -24,7 +24,8 @@
 // OpenSSL defaults prefer a cipher the kernel cannot take, --openssl-conf=cbc), a plain-OpenSSL peer that offers only
 // such a cipher must be refused, and without the kernel tls module every handshake must fail. A plain-OpenSSL client
 // with a kernel-capable cipher must interoperate with the Net2 server, and peer verification must still reject a client
-// whose chain has a different root. A handshake write to a connection shut down for writing, and data writes to a
+// whose chain has a different root, and a kernel TLS client must read a plain-OpenSSL server's data intact after the
+// session tickets that server sends. A handshake write to a connection shut down for writing, and data writes to a
 // connection the peer reset, must fail cleanly, not raise SIGPIPE, and leave no SIGPIPE pending.
 // Plain TCP connections get the same data checks, plus a sender that fills the socket while the receiver waits.
 //
@@ -188,6 +189,72 @@ struct RawClient {
 		EVP_PKEY_free(key);
 		X509_free(cert);
 		BIO_free(caBio);
+		BIO_free(keyBio);
+		BIO_free(certBio);
+		SSL_CTX_free(ctx);
+		return result;
+	}
+};
+
+// A blocking plain-OpenSSL server on its own thread with OpenSSL's default TLS 1.3 session tickets (a peer whose TLS
+// layer is not configured for kernel TLS sends them): accepts one connection on its listening socket, then writes
+// `payload`. Sets done when finished; ok when the payload was written.
+struct RawServer {
+	std::atomic<bool> done{ false };
+	std::atomic<bool> ok{ false };
+	std::thread thread;
+	int listenFd = -1;
+	uint16_t port = 0;
+
+	void start(Creds own, std::string payload) {
+		listenFd = socket(AF_INET, SOCK_STREAM, 0);
+		sockaddr_in addr{};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		bind(listenFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+		listen(listenFd, 1);
+		socklen_t len = sizeof(addr);
+		getsockname(listenFd, reinterpret_cast<sockaddr*>(&addr), &len);
+		port = ntohs(addr.sin_port);
+		thread = std::thread([this, own, payload]() {
+			ok = run(listenFd, own, payload);
+			done = true;
+		});
+	}
+
+	static bool run(int listenFd, const Creds& own, const std::string& payload) {
+		SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+		BIO* certBio = BIO_new_mem_buf(own.cert.data(), own.cert.size());
+		X509* cert = PEM_read_bio_X509(certBio, nullptr, nullptr, nullptr);
+		BIO* keyBio = BIO_new_mem_buf(own.key.data(), own.key.size());
+		EVP_PKEY* key = PEM_read_bio_PrivateKey(keyBio, nullptr, nullptr, nullptr);
+		SSL_CTX_use_certificate(ctx, cert);
+		SSL_CTX_use_PrivateKey(ctx, key);
+		SSL_CTX_set_num_tickets(ctx, 2);
+		bool result = false;
+		const int fd = accept(listenFd, nullptr, nullptr);
+		SSL* ssl = SSL_new(ctx);
+		if (fd >= 0 && SSL_set_fd(ssl, fd) == 1 && SSL_accept(ssl) == 1) {
+			size_t off = 0;
+			while (off < payload.size()) {
+				const int n = SSL_write(ssl, payload.data() + off, static_cast<int>(payload.size() - off));
+				if (n <= 0) {
+					break;
+				}
+				off += n;
+			}
+			result = off == payload.size();
+			// Wait for the client to close, so the payload is not cut short by a reset.
+			char b;
+			while (SSL_read(ssl, &b, 1) > 0) {
+			}
+		}
+		SSL_free(ssl);
+		if (fd >= 0) {
+			close(fd);
+		}
+		EVP_PKEY_free(key);
+		X509_free(cert);
 		BIO_free(keyBio);
 		BIO_free(certBio);
 		SSL_CTX_free(ctx);
@@ -388,6 +455,46 @@ Future<Void> rawClientCheck(Creds trusted, Creds stranger, std::string label, bo
 	}
 }
 
+// A kernel TLS client must read intact a stream whose first records are session tickets (non-data records that it
+// hands to OpenSSL), also when it reads in pieces smaller than the data record that follows them.
+Future<Void> rawServerTicketsCheck(Creds trusted, std::string label) {
+	const std::string payload = pattern(256 << 10, 5);
+	RawServer server;
+	server.start(trusted, payload);
+	Reference<IConnection> client = co_await INetworkConnections::net()->connect(
+	    NetworkAddress::parse("127.0.0.1:" + std::to_string(server.port) + ":tls"));
+	bool intact = false;
+	std::string outcome = "intact";
+	try {
+		co_await client->connectHandshake();
+		std::string got(payload.size(), '\0');
+		int have = 0;
+		while (have < (int)payload.size()) {
+			uint8_t* at = reinterpret_cast<uint8_t*>(got.data()) + have;
+			const int n = client->read(at, at + std::min<int>(100, payload.size() - have));
+			have += n;
+			if (n == 0) {
+				co_await client->onReadable();
+			}
+		}
+		intact = got == payload;
+		if (!intact) {
+			outcome = "corrupted";
+		}
+	} catch (Error& e) {
+		outcome = e.name();
+	}
+	client->close();
+	while (!server.done) {
+		co_await delay(0.01);
+	}
+	server.thread.join();
+	close(server.listenFd);
+	check(intact && server.ok,
+	      label + ": 256 KB after a plain OpenSSL server's session tickets, read 100 bytes at a time (" + outcome +
+	          ")");
+}
+
 // OpenSSL writes to sockets it owns without MSG_NOSIGNAL. A handshake write to a connection shut down for writing, and
 // data writes to a connection the peer reset, must fail with connection_failed instead of killing the process with
 // SIGPIPE.
@@ -539,6 +646,9 @@ Future<Void> runOne(bool tls,
 
 	if (tls) {
 		co_await rawClientCheck(trusted, stranger, label, !useKtls || rawCipherOk);
+	}
+	if (tls && useKtls && rawCipherOk) {
+		co_await rawServerTicketsCheck(trusted, label);
 	}
 	co_await sigpipeCheck(label, tls);
 

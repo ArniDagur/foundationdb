@@ -1977,6 +1977,9 @@ public:
 		++g_net2->countReadProbes;
 #ifdef __linux__
 		if (uring) {
+			if (SSL_pending(ssl_sock.native_handle()) > 0) {
+				return Void();
+			}
 			return uring->onReadable();
 		}
 		if (ringMode) {
@@ -1998,7 +2001,21 @@ public:
 #ifdef __linux__
 		if (uring) {
 			int errnum = 0;
-			int n = uring->read(begin, end, errnum);
+			int n = 0;
+			// SSL_read past a control record (below) returns at most toRead bytes of the application record after it;
+			// OpenSSL keeps the rest, which precedes everything still in the kernel.
+			if (SSL_pending(ssl_sock.native_handle()) > 0) {
+				n = static_cast<int>(opensslReadNonBlocking(begin, toRead, err));
+				if (n > 0) {
+					g_net2->bytesReceived += n;
+					return n;
+				}
+				if (err && err != boost::asio::error::would_block) {
+					onReadError(err);
+					throw connection_failed();
+				}
+			}
+			n = uring->read(begin, end, errnum);
 			if (n == UringSocket::kControlRecord) {
 				// A non-data record: OpenSSL reads it (through the kernel TLS layer) and may return data after it.
 				n = static_cast<int>(opensslReadNonBlocking(begin, toRead, err));
