@@ -291,7 +291,7 @@ public:
 		std::vector<Future<Void>> inFlight;
 		for (int64_t pos = begin; pos < end; pos += kZeroChunk) {
 			const int len = int(std::min<int64_t>(kZeroChunk, end - pos));
-			inFlight.push_back(write(zeros, len, pos));
+			inFlight.push_back(submitWrite(zeros, len, pos));
 			ctx.zeroFilledBytes += len;
 			if (inFlight.size() >= 4) {
 				co_await waitForAll(inFlight);
@@ -301,6 +301,46 @@ public:
 		co_await waitForAll(inFlight);
 	}
 	static constexpr int kZeroChunk = 1 << 20;
+
+	// Zero writes over [begin, end) (4 KiB aligned), after any earlier ones. Callers write into a file's growth
+	// without waiting for it, because fallocate finishes before truncate() returns; a zero write landing after such a
+	// write would destroy its data. So reads and writes from the lowest pending begin onwards wait for the zero
+	// writes.
+	Future<Void> fillZeros(int64_t begin, int64_t end) {
+		zeroFillingFrom = zeroFilling.isReady() ? begin : std::min(zeroFillingFrom, begin);
+		zeroFilling = writeZerosAfter(Reference<AsyncFileKAIO>::addRef(this), zeroFilling, begin, end);
+		return zeroFilling;
+	}
+
+	bool waitsForZeroFill(int64_t offset, int length) const {
+		return !zeroFilling.isReady() && offset + length > zeroFillingFrom;
+	}
+
+	static Future<Void> writeZerosAfter(Reference<AsyncFileKAIO> self,
+	                                    Future<Void> earlier,
+	                                    int64_t begin,
+	                                    int64_t end) {
+		co_await earlier;
+		co_await self->writeZeros(begin, end);
+	}
+
+	static Future<Void> writeAfterZeroFill(Reference<AsyncFileKAIO> self,
+	                                       Future<Void> fill,
+	                                       void const* data,
+	                                       int length,
+	                                       int64_t offset) {
+		co_await fill;
+		co_await self->submitWrite(data, length, offset);
+	}
+
+	static Future<int> readAfterZeroFill(Reference<AsyncFileKAIO> self,
+	                                     Future<Void> fill,
+	                                     void* data,
+	                                     int length,
+	                                     int64_t offset) {
+		co_await fill;
+		co_return co_await self->submitRead(data, length, offset);
+	}
 
 	static void init(Reference<IEventFD> ev, double ioTimeout) {
 		ASSERT(!FLOW_KNOBS->DISABLE_POSIX_KERNEL_AIO);
@@ -338,6 +378,13 @@ public:
 		if (failed) {
 			return io_timeout();
 		}
+		if (waitsForZeroFill(offset, length)) {
+			return readAfterZeroFill(Reference<AsyncFileKAIO>::addRef(this), zeroFilling, data, length, offset);
+		}
+		return submitRead(data, length, offset);
+	}
+
+	Future<int> submitRead(void* data, int length, int64_t offset) {
 
 		const int chunk = maxIOBytes();
 		if (chunk > 0 && length > chunk) {
@@ -393,6 +440,13 @@ public:
 		if (failed) {
 			return io_timeout();
 		}
+		if (waitsForZeroFill(offset, length)) {
+			return writeAfterZeroFill(Reference<AsyncFileKAIO>::addRef(this), zeroFilling, data, length, offset);
+		}
+		return submitWrite(data, length, offset);
+	}
+
+	Future<Void> submitWrite(void const* data, int length, int64_t offset) {
 
 		const int chunk = maxIOBytes();
 		if (chunk > 0 && length > chunk) {
@@ -437,7 +491,7 @@ public:
 #endif
 	Future<Void> zeroRange(int64_t offset, int64_t length) override {
 		if (mayZeroFill() && offset % 4096 == 0 && length % 4096 == 0) {
-			return writeZeros(offset, offset + length); // FALLOC_FL_ZERO_RANGE would leave unwritten extents
+			return fillZeros(offset, offset + length); // FALLOC_FL_ZERO_RANGE would leave unwritten extents
 		}
 		bool success = false;
 		if (ctx.fallocateZeroSupported) {
@@ -472,7 +526,7 @@ public:
 			const int64_t from = lastFileSize;
 			lastFileSize = nextFileSize = size;
 			KAIOLogEvent(logFile, id, OpLogEntry::TRUNCATE, OpLogEntry::COMPLETE, size / 4096, 0);
-			return writeZeros(from, size);
+			return fillZeros(from, size);
 		}
 		if (ctx.fallocateSupported && size >= lastFileSize) {
 			result = fallocate(fd, 0, 0, size);
@@ -746,6 +800,9 @@ private:
 	int fd, flags;
 	int64_t lastFileSize, nextFileSize;
 	std::pair<dev_t, ino_t> inode{ 0, 0 };
+	// Pending zero writes (fillZeros()) and the lowest offset they cover.
+	Future<Void> zeroFilling = Void();
+	int64_t zeroFillingFrom = 0;
 	std::string filename;
 	Int64MetricHandle countFileLogicalWrites;
 	Int64MetricHandle countFileLogicalReads;

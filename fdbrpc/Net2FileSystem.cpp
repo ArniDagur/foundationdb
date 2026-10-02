@@ -643,6 +643,69 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillGrowth") {
 		throw err.get();
 	}
 }
+
+// The disk queue writes into the end of a file it is growing without waiting for the growth (truncate), which
+// fallocate finishes before truncate() returns. With KAIO_ZERO_FILL_GROWTH the growth is zero writes, issued a few at a
+// time; data written into the grown range while they are still to come must survive them.
+TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillGrowthOrdering") {
+	if (g_network->isSimulated()) {
+		co_return;
+	}
+	auto* knobs = const_cast<FlowKnobs*>(FLOW_KNOBS);
+	const bool savedZeroFill = knobs->KAIO_ZERO_FILL_GROWTH;
+	const bool savedRing = knobs->KAIO_IO_URING;
+	knobs->KAIO_IO_URING = true;
+	knobs->KAIO_ZERO_FILL_GROWTH = true;
+	constexpr int64_t MB = 1 << 20;
+	constexpr int kPages = 16;
+	const std::string filename =
+	    joinPath(params.getDataDir(),
+	             format("__KAIO_ZERO_FILL_ORDER_%s__.fdq", deterministicRandom()->randomUniqueID().toString().c_str()));
+	uint8_t* pages = static_cast<uint8_t*>(allocateFast4kAligned(kPages * 4096));
+	uint8_t* back = static_cast<uint8_t*>(allocateFast4kAligned(4096));
+	Reference<IAsyncFile> f;
+	Optional<Error> err;
+	try {
+		f = co_await AsyncFileKAIO::open(filename,
+		                                 IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE |
+		                                     IAsyncFile::OPEN_CREATE,
+		                                 0644,
+		                                 nullptr);
+		co_await f->truncate(4096);
+		// Grow to 16 MB and, without waiting, write a page into each megabyte of the new range.
+		std::vector<Future<Void>> pending;
+		pending.push_back(f->truncate(kPages * MB));
+		for (int k = 0; k < kPages; k++) {
+			memset(pages + k * 4096, 0x40 + k, 4096);
+			pending.push_back(f->write(pages + k * 4096, 4096, 4096 + k * MB));
+		}
+		co_await waitForAll(pending);
+		int lost = 0;
+		for (int k = 0; k < kPages; k++) {
+			const int n = co_await f->read(back, 4096, 4096 + k * MB);
+			ASSERT_EQ(n, 4096);
+			for (int i = 0; i < 4096; i++) {
+				if (back[i] != uint8_t(0x40 + k)) {
+					lost++;
+					break;
+				}
+			}
+		}
+		printf("KAIO zero-fill growth ordering: %d of %d pages written during growth were overwritten\n", lost, kPages);
+		ASSERT_EQ(lost, 0);
+	} catch (Error& e) {
+		err = e;
+	}
+	knobs->KAIO_ZERO_FILL_GROWTH = savedZeroFill;
+	knobs->KAIO_IO_URING = savedRing;
+	freeFast4kAligned(kPages * 4096, pages);
+	freeFast4kAligned(4096, back);
+	f.clear();
+	co_await AsyncFileEIO::deleteFile(filename, true);
+	if (err.present()) {
+		throw err.get();
+	}
+}
 // With KAIO_CLEAR_SETGID, opening a KAIO file read-write clears a set-group-ID bit that has no group execute (and
 // leaves the rest of the mode); without the knob the mode is left alone.
 TEST_CASE("/fdbrpc/AsyncFileKAIO/ClearSetGID") {
