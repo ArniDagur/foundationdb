@@ -418,6 +418,7 @@ Future<Void> startSystemMonitor(std::string dataFolder,
 	initializeSystemMonitorMachineState(SystemMonitorMachineState(
 	    dataFolder, dcId, zoneId, machineId, datahallId, g_network->getLocalAddress().ip, FDB_VT_VERSION));
 
+	startSystemStatisticsThread();
 	systemMonitor();
 	return recurring(&systemMonitor, SERVER_KNOBS->SYSTEM_MONITOR_FREQUENCY, TaskPriority::FlushTrace);
 }

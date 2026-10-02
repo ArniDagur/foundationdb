@@ -24,6 +24,13 @@
 #include "flow/SystemMonitor.h"
 #include "flow/Knobs.h"
 #include "flow/MemoryTracker.h"
+#include "flow/IThreadPool.h"
+#include "flow/UnitTest.h"
+
+#ifdef __linux__
+#include <pthread.h>
+#include <time.h>
+#endif
 
 #if defined(ALLOC_INSTRUMENTATION) && defined(__linux__)
 #include <cxxabi.h>
@@ -89,13 +96,6 @@ void NetworkData::init() {
 	countFilePageCacheEvictions = Int64Metric::getValueOrDefault("EvictablePageCache.CacheEvictions"_sr);
 }
 
-void systemMonitor() {
-	static StatisticsState statState = StatisticsState();
-#if !DEBUG_DETERMINISM
-	customSystemMonitor("ProcessMetrics", &statState, true);
-#endif
-}
-
 SystemStatistics getSystemStatistics() {
 	static StatisticsState statState = StatisticsState();
 	const IPAddress ipAddr = machineState.ip.present() ? machineState.ip.get() : IPAddress();
@@ -144,10 +144,14 @@ std::string capitalizeCgroupKey(const std::string& key) {
 
 } // anonymous namespace
 
-SystemStatistics customSystemMonitor(std::string const& eventName, StatisticsState* statState, bool machineMetrics) {
-	const IPAddress ipAddr = machineState.ip.present() ? machineState.ip.get() : IPAddress();
-	SystemStatistics currentStats = getSystemStatistics(
-	    machineState.folder.present() ? machineState.folder.get() : "", &ipAddr, &statState->systemState, true);
+namespace {
+
+// Logs one interval's statistics: the operating system's, already collected in currentStats, and Flow's own counters,
+// which this reads. Runs on the network thread.
+void logSystemStatistics(std::string const& eventName,
+                         StatisticsState* statState,
+                         bool machineMetrics,
+                         SystemStatistics const& currentStats) {
 	NetworkData netData;
 	netData.init();
 	if (!g_network->isSimulated() && currentStats.initialized) {
@@ -492,9 +496,123 @@ SystemStatistics customSystemMonitor(std::string const& eventName, StatisticsSta
 			lastMemTrackerDump = now();
 		}
 	}
+}
 
+#ifdef __linux__
+// Collects the operating-system statistics (/proc and /sys reads, getifaddrs(), statvfs()) off the network thread:
+// they block it for milliseconds every interval, and every commit waits for the slowest of dozens of processes. The
+// collector thread owns the StatisticsState's SystemStatisticsState; one collection is in flight at a time.
+struct SystemStatisticsCollector final : IThreadPoolReceiver {
+	void init() override {}
+
+	struct Collect final : TypedAction<SystemStatisticsCollector, Collect> {
+		std::string dataFolder;
+		IPAddress ip;
+		SystemStatisticsState** state = nullptr;
+		clockid_t mainThreadClock{};
+		ThreadReturnPromise<SystemStatistics> result;
+		double getTimeEstimate() const override { return 0; }
+	};
+
+	void action(Collect& c) {
+		try {
+			timespec ts{};
+			clock_gettime(c.mainThreadClock, &ts);
+			c.result.send(getSystemStatistics(c.dataFolder, &c.ip, c.state, true, ts.tv_sec + ts.tv_nsec * 1e-9));
+		} catch (Error& e) {
+			c.result.sendError(e);
+		} catch (...) {
+			c.result.sendError(unknown_error());
+		}
+	}
+};
+
+Reference<IThreadPool> collectorPool;
+clockid_t networkThreadClock{};
+Future<Void> collection;
+
+// Requires startSystemStatisticsThread() and no other collection for statState in flight.
+Future<SystemStatistics> collectSystemStatistics(StatisticsState* statState) {
+	auto* c = new SystemStatisticsCollector::Collect();
+	c->dataFolder = machineState.folder.present() ? machineState.folder.get() : "";
+	c->ip = machineState.ip.present() ? machineState.ip.get() : IPAddress();
+	c->state = &statState->systemState;
+	c->mainThreadClock = networkThreadClock;
+	Future<SystemStatistics> stats = c->result.getFuture();
+	collectorPool->post(c);
+	return stats;
+}
+
+Future<Void> collectAndLog(StatisticsState* statState) {
+	try {
+		SystemStatistics currentStats = co_await collectSystemStatistics(statState);
+		logSystemStatistics("ProcessMetrics", statState, true, currentStats);
+	} catch (Error& e) {
+		if (e.code() == error_code_actor_cancelled) {
+			throw;
+		}
+		TraceEvent(SevWarnAlways, "SystemStatisticsCollectionFailed").error(e);
+	}
+}
+#endif
+
+} // anonymous namespace
+
+SystemStatistics customSystemMonitor(std::string const& eventName, StatisticsState* statState, bool machineMetrics) {
+	const IPAddress ipAddr = machineState.ip.present() ? machineState.ip.get() : IPAddress();
+	SystemStatistics currentStats = getSystemStatistics(
+	    machineState.folder.present() ? machineState.folder.get() : "", &ipAddr, &statState->systemState, true);
+	logSystemStatistics(eventName, statState, machineMetrics, currentStats);
 	return currentStats;
 }
+
+void startSystemStatisticsThread() {
+#ifdef __linux__
+	if (collectorPool || g_network->isSimulated() || pthread_getcpuclockid(pthread_self(), &networkThreadClock) != 0) {
+		return;
+	}
+	collectorPool = createGenericThreadPool();
+	collectorPool->addThread(new SystemStatisticsCollector(), "fdb-sysstats");
+#endif
+}
+
+void systemMonitor() {
+	static StatisticsState statState = StatisticsState();
+#if !DEBUG_DETERMINISM
+#ifdef __linux__
+	if (collectorPool) {
+		// Logged when the collector thread is done; an interval whose collection is still running is skipped.
+		if (!collection.isValid() || collection.isReady()) {
+			collection = collectAndLog(&statState);
+		}
+		return;
+	}
+#endif
+	customSystemMonitor("ProcessMetrics", &statState, true);
+#endif
+}
+
+#ifdef __linux__
+// MainThreadCPUSeconds stays the network thread's CPU time when the collector thread gathers the statistics.
+TEST_CASE("/flow/SystemMonitor/StatisticsThread") {
+	startSystemStatisticsThread();
+	if (!collectorPool) {
+		co_return;
+	}
+	StatisticsState state;
+	co_await collectSystemStatistics(&state);
+	double start = timer();
+	volatile uint64_t spins = 0;
+	while (timer() - start < 0.2) {
+		spins = spins + 1;
+	}
+	SystemStatistics stats = co_await collectSystemStatistics(&state);
+	ASSERT(stats.initialized);
+	ASSERT_GE(stats.mainThreadCPUSeconds, 0.15);
+	ASSERT_LT(stats.mainThreadCPUSeconds, 1.0);
+	ASSERT_GE(stats.processCPUSeconds, stats.mainThreadCPUSeconds - 0.01);
+}
+#endif
 
 Future<Void> startMemoryUsageMonitor(uint64_t memLimit) {
 	if (memLimit == 0) {

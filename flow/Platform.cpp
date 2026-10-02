@@ -1567,14 +1567,15 @@ void initPdhStrings(SystemStatisticsState* state, std::string dataFolder) {
 SystemStatistics getSystemStatistics(std::string const& dataFolder,
                                      const IPAddress* ip,
                                      SystemStatisticsState** statState,
-                                     bool logDetails) {
+                                     bool logDetails,
+                                     std::optional<double> mainThreadCPUSeconds) {
 	if ((*statState) == nullptr)
 		(*statState) = new SystemStatisticsState();
 	SystemStatistics returnStats;
 
 	double nowTime = timer();
 	double nowClockProcess = getProcessorTimeProcess();
-	double nowClockThread = getProcessorTimeThread();
+	double nowClockThread = mainThreadCPUSeconds.has_value() ? *mainThreadCPUSeconds : getProcessorTimeThread();
 	returnStats.elapsed = nowTime - (*statState)->lastTime;
 
 	returnStats.initialized = (*statState)->lastTime != 0;

@@ -108,6 +108,9 @@ struct StatisticsState {
 };
 
 void systemMonitor();
+// From here on, systemMonitor() collects the operating-system statistics on a dedicated thread and logs them on the
+// network thread when they arrive (Linux, outside simulation; otherwise a no-op). Call on the network thread.
+void startSystemStatisticsThread();
 SystemStatistics customSystemMonitor(std::string const& eventName,
                                      StatisticsState* statState,
                                      bool machineMetrics = false);

@@ -167,6 +167,7 @@ inline static T& makeDependent(T& value) {
 }
 
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -279,10 +280,12 @@ struct SystemStatisticsState;
 
 struct IPAddress;
 
+// mainThreadCPUSeconds: the network thread's CPU time, for callers on another thread (the calling thread's otherwise).
 SystemStatistics getSystemStatistics(std::string const& dataFolder,
                                      const IPAddress* ip,
                                      SystemStatisticsState** statState,
-                                     bool logDetails);
+                                     bool logDetails,
+                                     std::optional<double> mainThreadCPUSeconds = {});
 
 double getProcessorTimeThread();
 
