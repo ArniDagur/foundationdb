@@ -1810,8 +1810,10 @@ Future<Void> recurringAsync(
 	}
 }
 
+// Cancellation destroys the frame (releasing `in`) instead of throwing actor_cancelled through it: wrapped requests
+// are routinely abandoned, e.g. quorum stragglers.
 template <class T>
-Future<T> brokenPromiseToNever(Future<T> in, ExplicitVoid = {}) {
+Future<T> brokenPromiseToNever(Future<T> in, ExplicitVoid = {}, NoThrowOnCancel = {}) {
 	Error err;
 	try {
 		T t = co_await in;

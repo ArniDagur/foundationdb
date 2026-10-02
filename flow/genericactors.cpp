@@ -22,6 +22,8 @@
 #include "flow/UnitTest.h"
 #include "flow/CoroUtils.h"
 
+#include <exception>
+
 Future<bool> allTrue(std::vector<Future<bool>> all) {
 	for (int i = 0; i != all.size(); ++i) {
 		bool r = co_await all[i];
@@ -662,4 +664,36 @@ TEST_CASE("/flow/genericactors/Trigger") {
 	int errorCode = co_await getVoidErrorCode(trigger(SetAsyncVarTrue{ called }, Future<Void>(operation_failed())));
 	ASSERT_EQ(errorCode, error_code_operation_failed);
 	ASSERT(!called->get());
+}
+
+namespace {
+
+// Never completes; records std::uncaught_exceptions() when its frame is destroyed, which shows whether whoever
+// released the last reference did so while unwinding a C++ exception.
+Future<Void> recordUnwindingOnRelease(int* uncaughtAtRelease, NoThrowOnCancel = {}) {
+	struct Recorder {
+		int* out;
+		~Recorder() { *out = std::uncaught_exceptions(); }
+	} recorder{ uncaughtAtRelease };
+	co_await Future<Void>(Never());
+}
+
+} // namespace
+
+TEST_CASE("/flow/genericactors/BrokenPromiseToNever/CancelWithoutUnwinding") {
+	int uncaughtAtRelease = -1;
+	Future<Void> wrapped = brokenPromiseToNever(recordUnwindingOnRelease(&uncaughtAtRelease));
+	ASSERT(!wrapped.isReady());
+	wrapped.cancel();
+	ASSERT_EQ(uncaughtAtRelease, 0);
+	ASSERT(wrapped.isError() && wrapped.getError().code() == error_code_actor_cancelled);
+
+	Promise<int> broken;
+	Future<int> neverAfterBroken = brokenPromiseToNever(broken.getFuture());
+	broken = Promise<int>();
+	co_await delay(0);
+	ASSERT(!neverAfterBroken.isReady());
+
+	int value = co_await brokenPromiseToNever(Future<int>(7));
+	ASSERT_EQ(value, 7);
 }

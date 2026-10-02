@@ -21,6 +21,7 @@
 // Unit tests for the Flow runtime and libraries
 
 #include <chrono>
+#include <exception>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -1847,5 +1848,74 @@ TEST_CASE("/fdbrpc/waitValueOrSignal/retryOnDisconnect") {
 	ASSERT_GE(numAttempts, 2);
 	TraceEvent("WaitValueOrSignalRetryTest").detail("NumAttempts", numAttempts);
 
+	return Void();
+}
+
+namespace {
+
+// Never completes; records std::uncaught_exceptions() when its frame is destroyed, which shows whether whoever
+// released the last reference did so while unwinding a C++ exception.
+Future<Void> recordUnwindingOnRelease(int* uncaughtAtRelease, NoThrowOnCancel = {}) {
+	struct Recorder {
+		int* out;
+		~Recorder() { *out = std::uncaught_exceptions(); }
+	} recorder{ uncaughtAtRelease };
+	co_await Future<Void>(Never());
+}
+
+// Failure monitor whose state-change futures report how they were released; every endpoint is healthy.
+class UnwindObservingFailureMonitor final : public IFailureMonitor {
+public:
+	int uncaughtAtRelease = -1;
+
+	FailureStatus getState(Endpoint const&) const override { return FailureStatus(false); }
+	FailureStatus getState(NetworkAddress const&) const override { return FailureStatus(false); }
+	void endpointNotFound(Endpoint const&) override {}
+	void unauthorizedEndpoint(Endpoint const&) override {}
+	Future<Void> onStateChanged(Endpoint const&) override { return recordUnwindingOnRelease(&uncaughtAtRelease); }
+	Future<Void> onDisconnectOrFailure(Endpoint const&) override { return Never(); }
+	Future<Void> onDisconnect(NetworkAddress const&) override { return Never(); }
+	bool onlyEndpointFailed(Endpoint const&) const override { return false; }
+	bool permanentlyFailed(Endpoint const&) const override { return false; }
+	bool knownUnauthorized(Endpoint const&) const override { return false; }
+	void notifyDisconnect(NetworkAddress const&) override {}
+	void setStatus(NetworkAddress const&, FailureStatus const&) override {}
+};
+
+class ScopedFailureMonitor : NonCopyable {
+public:
+	explicit ScopedFailureMonitor(IFailureMonitor* monitor) : saved(g_network->global(INetwork::enFailureMonitor)) {
+		g_network->setGlobal(INetwork::enFailureMonitor, (flowGlobalType)monitor);
+	}
+	~ScopedFailureMonitor() { g_network->setGlobal(INetwork::enFailureMonitor, saved); }
+
+private:
+	flowGlobalType saved;
+};
+
+} // namespace
+
+TEST_CASE("/fdbrpc/genericactors/SendCanceler/CancelWithoutUnwinding") {
+	UnwindObservingFailureMonitor monitor;
+	ScopedFailureMonitor scoped(&monitor);
+
+	ReplyPromise<Void> abandoned;
+	Future<Void> request = sendCanceler(abandoned, nullptr, Endpoint());
+	ASSERT(!request.isReady());
+	request.cancel();
+	ASSERT_EQ(monitor.uncaughtAtRelease, 0);
+	ASSERT(request.isError() && request.getError().code() == error_code_actor_cancelled);
+	return Void();
+}
+
+TEST_CASE("/fdbrpc/genericactors/SendCanceler/Reply") {
+	UnwindObservingFailureMonitor monitor;
+	ScopedFailureMonitor scoped(&monitor);
+
+	ReplyPromise<Void> answered;
+	Future<Void> reply = sendCanceler(answered, nullptr, Endpoint());
+	ASSERT(!reply.isReady());
+	answered.send(Void());
+	ASSERT(reply.isReady() && !reply.isError());
 	return Void();
 }
