@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <iostream>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <cstring>
 #include <string>
@@ -719,6 +720,25 @@ const char* getInterfaceName(const IPAddress& _ip) {
 #endif
 
 #if defined(__linux__)
+// getifaddrs() dumps every interface in the network namespace together with its per-CPU IPv6 statistics. With host
+// networking on a many-core node that takes tens of milliseconds on the network thread, every metrics interval, and
+// stalls everything queued behind it. The interface that carries the process's address does not change, so it is
+// looked up once per address; a failed lookup is retried next time.
+static const char* cachedInterfaceName(const IPAddress& ip) {
+	thread_local std::optional<IPAddress> cachedIp;
+	thread_local std::string cachedName;
+	if (cachedIp == ip) {
+		return cachedName.c_str();
+	}
+	const char* name = getInterfaceName(ip);
+	if (!name) {
+		return nullptr;
+	}
+	cachedIp = ip;
+	cachedName = name;
+	return cachedName.c_str();
+}
+
 void getNetworkTraffic(const IPAddress& ip,
                        uint64_t& bytesSent,
                        uint64_t& bytesReceived,
@@ -730,7 +750,7 @@ void getNetworkTraffic(const IPAddress& ip,
 	                          // other platforms do, and since all of our simulation testing is on Linux...
 	const char* ifa_name = nullptr;
 	try {
-		ifa_name = getInterfaceName(ip);
+		ifa_name = cachedInterfaceName(ip);
 	} catch (Error& e) {
 		if (e.code() != error_code_platform_error) {
 			throw;
