@@ -1037,6 +1037,8 @@ public:
 	int64_t TLOG_SPILL_THRESHOLD;
 	int64_t TLOG_HARD_LIMIT_BYTES;
 	double TLOG_MIN_AVAILABLE_SPACE_RATIO;
+	bool TLOG_DISK_SPACE_CHECK_CACHE; // low-disk admission reuses disk-space samples and skips them when disabled
+	double TLOG_DISK_SPACE_CHECK_INTERVAL; // maximum age of a reused disk-space sample, in seconds
 	int64_t TLOG_RECOVER_MEMORY_LIMIT;
 	double TLOG_IGNORE_POP_AUTO_ENABLE_DELAY;
 

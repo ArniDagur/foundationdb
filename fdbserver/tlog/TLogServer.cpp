@@ -385,6 +385,12 @@ struct TLogData : NonCopyable {
 
 	Reference<AsyncVar<bool>> degraded;
 	Reference<AsyncVar<bool>> lowDiskTLogExclusion;
+
+	// Last disk-space sample of the low-disk admission check (TLOG_DISK_SPACE_CHECK_CACHE).
+	StorageBytes sampledKvStoreBytes;
+	StorageBytes sampledQueueBytes;
+	double diskSpaceSampledAt = -std::numeric_limits<double>::infinity();
+
 	std::vector<TagsAndMessage> tempTagMessages;
 
 	// Distribution of end-to-end server latency of tlog commit requests.
@@ -3506,9 +3512,26 @@ double effectiveTLogMinAvailableSpaceRatio() {
 }
 
 static bool canTLogAcceptNewData(TLogData* self, Reference<LogData> logData, Version ver, bool failRecovery) {
-	StorageBytes kvStoreBytes = self->persistentData->getStorageBytes();
-	StorageBytes queueBytes = self->rawPersistentQueue->getStorageBytes();
 	const double minAvailableSpaceRatio = effectiveTLogMinAvailableSpaceRatio();
+	StorageBytes kvStoreBytes;
+	StorageBytes queueBytes;
+	if (SERVER_KNOBS->TLOG_DISK_SPACE_CHECK_CACHE) {
+		// This runs for every version a remote TLog pulls, and each disk-space probe is a realpath() plus a
+		// statvfs() that sums per-CPU counters: probing every time costs a remote TLog about a quarter of its CPU.
+		if (minAvailableSpaceRatio <= 0.0) {
+			return true;
+		}
+		if (now() - self->diskSpaceSampledAt >= SERVER_KNOBS->TLOG_DISK_SPACE_CHECK_INTERVAL) {
+			self->sampledKvStoreBytes = self->persistentData->getStorageBytes();
+			self->sampledQueueBytes = self->rawPersistentQueue->getStorageBytes();
+			self->diskSpaceSampledAt = now();
+		}
+		kvStoreBytes = self->sampledKvStoreBytes;
+		queueBytes = self->sampledQueueBytes;
+	} else {
+		kvStoreBytes = self->persistentData->getStorageBytes();
+		queueBytes = self->rawPersistentQueue->getStorageBytes();
+	}
 	if (self->shouldAcceptNewData(kvStoreBytes, queueBytes, minAvailableSpaceRatio)) {
 		return true;
 	}
@@ -5005,4 +5028,153 @@ TEST_CASE("Lfdbserver/tlogserver/VersionMessagesOverheadFactor") {
 	}
 
 	return Void();
+}
+
+namespace {
+
+// Disk stores whose only live behavior is reporting configurable StorageBytes and counting the probes.
+class DiskSpaceProbeKVStore final : public IKeyValueStore {
+public:
+	StorageBytes bytes;
+	mutable int probes = 0;
+
+	StorageBytes getStorageBytes() const override {
+		++probes;
+		return bytes;
+	}
+	KeyValueStoreType getType() const override { return KeyValueStoreType::MEMORY; }
+	void set(KeyValueRef, const Arena*) override { UNREACHABLE(); }
+	void clear(KeyRangeRef, const Arena*) override { UNREACHABLE(); }
+	Future<Void> commit(bool) override { UNREACHABLE(); }
+	Future<Optional<Value>> readValue(KeyRef, Optional<ReadOptions>) override { UNREACHABLE(); }
+	Future<Optional<Value>> readValuePrefix(KeyRef, int, Optional<ReadOptions>) override { UNREACHABLE(); }
+	Future<RangeResult> readRange(KeyRangeRef, int, int, Optional<ReadOptions>) override { UNREACHABLE(); }
+	Future<Void> getError() const override { return Never(); }
+	Future<Void> onClosed() const override { return Never(); }
+	void dispose() override {}
+	void close() override {}
+};
+
+class DiskSpaceProbeDiskQueue final : public IDiskQueue {
+public:
+	StorageBytes bytes;
+	mutable int probes = 0;
+
+	StorageBytes getStorageBytes() const override {
+		++probes;
+		return bytes;
+	}
+	Future<bool> initializeRecovery(location) override { UNREACHABLE(); }
+	Future<Standalone<StringRef>> readNext(int) override { UNREACHABLE(); }
+	location getNextReadLocation() const override { UNREACHABLE(); }
+	location getNextPushLocation() const override { UNREACHABLE(); }
+	Future<Standalone<StringRef>> read(location, location, CheckHashes) override { UNREACHABLE(); }
+	location push(StringRef) override { UNREACHABLE(); }
+	void pop(location) override { UNREACHABLE(); }
+	Future<Void> commit() override { UNREACHABLE(); }
+	int getCommitOverhead() const override { return 0; }
+	Future<Void> getError() const override { return Never(); }
+	Future<Void> onClosed() const override { return Never(); }
+	void dispose() override {}
+	void close() override {}
+};
+
+class DiskSpaceCheckFixture : NonCopyable {
+public:
+	DiskSpaceCheckFixture(bool cache, double interval, double minRatio)
+	  : savedCache(SERVER_KNOBS->TLOG_DISK_SPACE_CHECK_CACHE),
+	    savedInterval(SERVER_KNOBS->TLOG_DISK_SPACE_CHECK_INTERVAL),
+	    savedMinRatio(SERVER_KNOBS->TLOG_MIN_AVAILABLE_SPACE_RATIO),
+	    shared(deterministicRandom()->randomUniqueID(),
+	           deterministicRandom()->randomUniqueID(),
+	           &kvStore,
+	           &queue,
+	           makeReference<AsyncVar<ServerDBInfo>>(ServerDBInfo()),
+	           makeReference<AsyncVar<bool>>(false),
+	           makeReference<AsyncVar<bool>>(false),
+	           "",
+	           makeReference<AsyncVar<bool>>(false)),
+	    logData(makeReference<LogData>(&shared,
+	                                   TLogInterface(LocalityData()),
+	                                   invalidTag,
+	                                   true,
+	                                   0,
+	                                   0,
+	                                   deterministicRandom()->randomUniqueID(),
+	                                   g_network->protocolVersion(),
+	                                   TLogSpillType::VALUE,
+	                                   std::vector<Tag>{},
+	                                   "DiskSpaceCheckTest")) {
+		auto* knobs = const_cast<ServerKnobs*>(SERVER_KNOBS);
+		knobs->TLOG_DISK_SPACE_CHECK_CACHE = cache;
+		knobs->TLOG_DISK_SPACE_CHECK_INTERVAL = interval;
+		knobs->TLOG_MIN_AVAILABLE_SPACE_RATIO = minRatio;
+		setAvailable(0.5);
+	}
+
+	~DiskSpaceCheckFixture() {
+		shared.terminated.send(Void());
+		auto* knobs = const_cast<ServerKnobs*>(SERVER_KNOBS);
+		knobs->TLOG_DISK_SPACE_CHECK_CACHE = savedCache;
+		knobs->TLOG_DISK_SPACE_CHECK_INTERVAL = savedInterval;
+		knobs->TLOG_MIN_AVAILABLE_SPACE_RATIO = savedMinRatio;
+	}
+
+	void setAvailable(double ratio) {
+		const int64_t total = 1e12;
+		kvStore.bytes = queue.bytes = StorageBytes(total * ratio, total, 0, total * ratio);
+	}
+
+	bool accepts() { return canTLogAcceptNewData(&shared, logData, 100, false); }
+	int probes() const { return kvStore.probes + queue.probes; }
+
+private:
+	const bool savedCache;
+	const double savedInterval;
+	const double savedMinRatio;
+	DiskSpaceProbeKVStore kvStore;
+	DiskSpaceProbeDiskQueue queue;
+	TLogData shared;
+	Reference<LogData> logData;
+};
+
+} // namespace
+
+TEST_CASE("/fdbserver/tlog/DiskSpaceCheck/ProbesEveryTimeWithoutCache") {
+	DiskSpaceCheckFixture f(false, 1.0, 0.0);
+	for (int i = 0; i < 3; ++i) {
+		ASSERT(f.accepts());
+	}
+	ASSERT_EQ(f.probes(), 6);
+	return Void();
+}
+
+TEST_CASE("/fdbserver/tlog/DiskSpaceCheck/DisabledRatioSkipsProbes") {
+	DiskSpaceCheckFixture f(true, 1.0, 0.0);
+	f.setAvailable(0.0);
+	for (int i = 0; i < 3; ++i) {
+		ASSERT(f.accepts());
+	}
+	ASSERT_EQ(f.probes(), 0);
+	return Void();
+}
+
+TEST_CASE("/fdbserver/tlog/DiskSpaceCheck/CachedSampleExpires") {
+	const double interval = 0.2;
+	DiskSpaceCheckFixture f(true, interval, 0.1);
+	for (int i = 0; i < 5; ++i) {
+		ASSERT(f.accepts());
+	}
+	ASSERT_EQ(f.probes(), 2);
+
+	// The disk fills up: the check keeps answering from the sample until it expires.
+	f.setAvailable(0.01);
+	ASSERT(f.accepts());
+	ASSERT_EQ(f.probes(), 2);
+
+	co_await delay(interval * 1.5);
+	ASSERT(!f.accepts());
+	ASSERT_EQ(f.probes(), 4);
+	ASSERT(!f.accepts());
+	ASSERT_EQ(f.probes(), 4);
 }
