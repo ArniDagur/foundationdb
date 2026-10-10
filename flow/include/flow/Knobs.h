@@ -231,6 +231,10 @@ public:
 	int TLS_HANDSHAKE_LIMIT;
 	bool DISABLE_MAINTHREAD_TLS_HANDSHAKE;
 	int TLS_HANDSHAKE_FLOWLOCK_PRIORITY;
+	// Whether TLS connections have the kernel (kTLS) encrypt and decrypt records after the handshake. Needs OpenSSL
+	// built with kTLS support and the Linux tls module; each direction of a connection falls back to user-space TLS
+	// when the kernel does not support the negotiated cipher.
+	bool TLS_USE_KTLS;
 
 	int NETWORK_TEST_CLIENT_COUNT;
 	int NETWORK_TEST_REPLY_SIZE;
