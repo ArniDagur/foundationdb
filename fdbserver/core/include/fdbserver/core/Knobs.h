@@ -1039,6 +1039,7 @@ public:
 	double TLOG_MIN_AVAILABLE_SPACE_RATIO;
 	int CONFIRM_EPOCH_LIVE_SPARE_TLOGS; // TLogs asked beyond a policy-satisfying set to confirm an epoch; <0: all
 	double CONFIRM_EPOCH_LIVE_HEDGE_DELAY; // seconds before the remaining TLogs are asked as well
+	double TLOG_DISK_SPACE_CHECK_INTERVAL;
 	int64_t TLOG_RECOVER_MEMORY_LIMIT;
 	double TLOG_IGNORE_POP_AUTO_ENABLE_DELAY;
 
