@@ -68,6 +68,12 @@ struct TLogInterface {
 	Optional<NetworkAddress> secondaryAddress() const { return peekMessages.getEndpoint().addresses.secondaryAddress; }
 	NetworkAddressList addresses() const { return peekMessages.getEndpoint().addresses; }
 
+	static_assert(TaskPriority::TLogConfirmRunning > TaskPriority::TLogPop &&
+	                  TaskPriority::TLogConfirmRunning > TaskPriority::TLogPeekReply &&
+	                  TaskPriority::TLogConfirmRunning > TaskPriority::TLogPeek &&
+	                  TaskPriority::TLogConfirmRunning > TaskPriority::TLogCommit,
+	              "GRV batches wait on confirmRunning replies; TLog data-path work must not delay them");
+
 	void initEndpoints() {
 		// NOTE: the adding order should be the same as the hardcoded indices in serialize()
 		std::vector<std::pair<FlowReceiver*, TaskPriority>> streams;

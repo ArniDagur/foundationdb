@@ -47,6 +47,8 @@ enum class TaskPriority {
 	ClusterController = 8650,
 	MasterTLogRejoin = 8646,
 	ProxyStorageRejoin = 8645,
+	// Above the TLog data path: it only replies, and every GRV batch waits for a quorum of these replies.
+	TLogConfirmRunning = 8625,
 	TLogQueuingMetrics = 8620,
 	TLogPop = 8610,
 	TLogPeekReply = 8600,
@@ -63,7 +65,6 @@ enum class TaskPriority {
 	ProxyCommit = 8545,
 	ProxyCommitBatcher = 8540,
 	TLogConfirmRunningReply = 8530,
-	TLogConfirmRunning = 8520,
 	ProxyGRVTimer = 8510,
 	GetConsistentReadVersion = 8500,
 	GetLiveCommittedVersionReply = 8490,

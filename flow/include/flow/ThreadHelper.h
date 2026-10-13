@@ -433,7 +433,7 @@ public:
 	}
 
 	void setCancel(Future<Void>&& cf) { cancelFuture = std::move(cf); }
-bool hasCancel() const { return cancelFuture.isValid(); }
+	bool hasCancel() const { return cancelFuture.isValid(); }
 
 	virtual void cancel() {
 		// Cancels the action and decrements the reference count by 1. The if statement is just an optimization. It's ok
