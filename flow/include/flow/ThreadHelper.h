@@ -433,6 +433,7 @@ public:
 	}
 
 	void setCancel(Future<Void>&& cf) { cancelFuture = std::move(cf); }
+bool hasCancel() const { return cancelFuture.isValid(); }
 
 	virtual void cancel() {
 		// Cancels the action and decrements the reference count by 1. The if statement is just an optimization. It's ok
@@ -827,20 +828,23 @@ Future<Void> doOnMainThread(Future<Void> signal,
                             OnMainThreadFunction<R> function,
                             ThreadSingleAssignmentVar<R>* result,
                             ExplicitVoid = {}) {
+	// Once result is set, its last reference can be dropped on a client thread, destroying result's future to this
+	// coroutine there. That future must be released here first: this coroutine's reference counts are not atomic.
 	try {
 		co_await signal;
 		R r = co_await function.invoke(result);
+		result->setCancel(Future<Void>());
 		result->send(r);
 	} catch (Error& e) {
 		if (!result->canBeSet()) {
 			TraceEvent(SevError, "OnMainThreadSetTwice").errorUnsuppressed(e);
 		}
+		result->setCancel(Future<Void>());
 		result->sendError(e);
 	}
 
 	function.destroy(result);
-	ThreadFuture<R> destroyResultAfterReturning(
-	    result); // Call result->delref(), but only after our return promise is no longer referenced on this thread
+	result->delref();
 	co_return Void();
 }
 

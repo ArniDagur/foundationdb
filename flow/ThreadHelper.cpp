@@ -72,3 +72,22 @@ TEST_CASE("/flow/safeThreadFutureToFuture/Cancel") {
 	}
 	thread.join();
 }
+
+// The result of onMainThread can be released last on a client thread, so it must not still hold the network thread's
+// future to the helper coroutine once it is set.
+TEST_CASE("/flow/onMainThread/ResultReleasesCoroutine") {
+	if (g_network->isSimulated())
+		co_return;
+	ThreadFuture<int> value = onMainThread([]() -> Future<int> { return 7; });
+	ASSERT_EQ(co_await safeThreadFutureToFuture(value), 7);
+	ASSERT(!value.extractPtr()->hasCancel());
+
+	ThreadFuture<int> error = onMainThread([]() -> Future<int> { return Future<int>(io_error()); });
+	try {
+		co_await safeThreadFutureToFuture(error);
+		ASSERT(false);
+	} catch (Error& e) {
+		ASSERT_EQ(e.code(), error_code_io_error);
+	}
+	ASSERT(!error.extractPtr()->hasCancel());
+}
