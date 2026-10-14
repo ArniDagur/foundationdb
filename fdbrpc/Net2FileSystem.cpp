@@ -706,6 +706,67 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillGrowthOrdering") {
 		throw err.get();
 	}
 }
+// Writes past the end of a file (as Redwood's pager grows its file) make launch() extend the file before submitting
+// them. With KAIO_ZERO_FILL_GROWTH that extension must not become zero writes over the range those writes fill.
+TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillWritePastEnd") {
+	if (g_network->isSimulated()) {
+		co_return;
+	}
+	auto* knobs = const_cast<FlowKnobs*>(FLOW_KNOBS);
+	const bool savedZeroFill = knobs->KAIO_ZERO_FILL_GROWTH;
+	const bool savedRing = knobs->KAIO_IO_URING;
+	knobs->KAIO_IO_URING = true;
+	knobs->KAIO_ZERO_FILL_GROWTH = true;
+	constexpr int64_t MB = 1 << 20;
+	constexpr int kPages = 16;
+	const std::string filename = joinPath(params.getDataDir(),
+	                                      format("__KAIO_ZERO_FILL_PAST_END_%s__.redwood-v1",
+	                                             deterministicRandom()->randomUniqueID().toString().c_str()));
+	uint8_t* pages = static_cast<uint8_t*>(allocateFast4kAligned(kPages * 4096));
+	uint8_t* back = static_cast<uint8_t*>(allocateFast4kAligned(4096));
+	Reference<IAsyncFile> f;
+	Optional<Error> err;
+	try {
+		f = co_await AsyncFileKAIO::open(filename,
+		                                 IAsyncFile::OPEN_UNBUFFERED | IAsyncFile::OPEN_READWRITE |
+		                                     IAsyncFile::OPEN_CREATE,
+		                                 0644,
+		                                 nullptr);
+		co_await f->truncate(4096);
+		std::vector<Future<Void>> pending;
+		for (int k = 0; k < kPages; k++) {
+			memset(pages + k * 4096, 0x60 + k, 4096);
+			pending.push_back(f->write(pages + k * 4096, 4096, 4096 + k * MB));
+		}
+		co_await waitForAll(pending);
+		co_await f->sync();
+		int lost = 0;
+		for (int k = 0; k < kPages; k++) {
+			const int n = co_await f->read(back, 4096, 4096 + k * MB);
+			ASSERT_EQ(n, 4096);
+			for (int i = 0; i < 4096; i++) {
+				if (back[i] != uint8_t(0x60 + k)) {
+					lost++;
+					break;
+				}
+			}
+		}
+		printf("KAIO zero fill, writes past the end: %d of %d pages overwritten\n", lost, kPages);
+		ASSERT_EQ(lost, 0);
+	} catch (Error& e) {
+		err = e;
+	}
+	knobs->KAIO_ZERO_FILL_GROWTH = savedZeroFill;
+	knobs->KAIO_IO_URING = savedRing;
+	freeFast4kAligned(kPages * 4096, pages);
+	freeFast4kAligned(4096, back);
+	f.clear();
+	co_await AsyncFileEIO::deleteFile(filename, true);
+	if (err.present()) {
+		throw err.get();
+	}
+}
+
 // With KAIO_CLEAR_SETGID, opening a KAIO file read-write clears a set-group-ID bit that has no group execute (and
 // leaves the rest of the mode); without the knob the mode is left alone.
 TEST_CASE("/fdbrpc/AsyncFileKAIO/ClearSetGID") {

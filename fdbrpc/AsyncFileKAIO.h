@@ -42,10 +42,13 @@
 #include "fdbrpc/Stats.h"
 #include "crc32/crc32c.h"
 #include "flow/genericactors.h"
+#include "flow/BooleanParam.h"
 
 // Set this to true to enable detailed KAIO request logging, which currently is written to a hardcoded location
 // /data/v7/fdb/
 #define KAIO_LOGGING 0
+
+FDB_BOOLEAN_PARAM(ZeroFillGrowth);
 
 struct SlowAioSubmit {
 	int64_t submitDuration;
@@ -505,7 +508,11 @@ public:
 		}
 		return success ? Void() : IAsyncFile::zeroRange(offset, length);
 	}
-	Future<Void> truncate(int64_t size) override {
+	Future<Void> truncate(int64_t size) override { return resize(size, ZeroFillGrowth::True); }
+
+	// Grows by zero writes only when zeroFillGrowth; growth for writes about to be submitted must not, since those
+	// writes fill the new range and zero writes landing after them would destroy their data.
+	Future<Void> resize(int64_t size, ZeroFillGrowth zeroFillGrowth) {
 		++countFileLogicalWrites;
 		++countLogicalWrites;
 
@@ -520,7 +527,7 @@ public:
 		KAIOLogEvent(logFile, id, OpLogEntry::TRUNCATE, OpLogEntry::START, size / 4096);
 		bool completed = false;
 		double begin = timer_monotonic();
-		if (mayZeroFill() && size > lastFileSize && lastFileSize % 4096 == 0 && size % 4096 == 0) {
+		if (zeroFillGrowth && mayZeroFill() && size > lastFileSize && lastFileSize % 4096 == 0 && size % 4096 == 0) {
 			// Grow with written zeros instead of unwritten extents (see writeUnwrittenRanges()). The new size is
 			// recorded first so that launch() does not fallocate ahead of the zero writes.
 			const int64_t from = lastFileSize;
@@ -721,7 +728,7 @@ public:
 					ASSERT_GT(truncateSize, 0);
 					ctx.preSubmitTruncateBytes += truncateSize;
 					largestTruncate = std::max(largestTruncate, truncateSize);
-					io->owner->truncate(io->owner->nextFileSize);
+					io->owner->resize(io->owner->nextFileSize, ZeroFillGrowth::False);
 				}
 			}
 			double truncateComplete = timer_monotonic();
