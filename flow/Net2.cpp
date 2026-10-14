@@ -2684,6 +2684,10 @@ void Net2::run() {
 #endif
 
 	unsigned int tasksSinceReact = 0;
+#ifdef __linux__
+	iouring::Ring* const submitRing =
+	    FLOW_KNOBS->NET_IO_URING && FLOW_KNOBS->NET_IO_URING_SUBMIT_AFTER_WRITES ? iouring::Ring::existing() : nullptr;
+#endif
 
 #ifdef WIN32
 	if (timeBeginPeriod(1) != TIMERR_NOERROR)
@@ -2791,6 +2795,14 @@ void Net2::run() {
 				trackAtPriority(currentTaskID, taskBegin);
 				minTaskID = currentTaskID;
 			}
+#ifdef __linux__
+			// Socket writes only queue their sends; without this they wait for the next react(), up to
+			// TASKS_PER_REACTOR_CHECK tasks later, and every hop of a version-ordered pipeline pays that wait.
+			if (submitRing && currentTaskID >= TaskPriority::WriteSocket && submitRing->queued() &&
+			    (!taskQueue.hasReadyTask() || taskQueue.getReadyTaskID() < TaskPriority::WriteSocket)) {
+				submitRing->flush();
+			}
+#endif
 
 			// attempt to empty out the IO backlog
 			if (tasksSinceReact >= FLOW_KNOBS->TASKS_PER_REACTOR_CHECK) {

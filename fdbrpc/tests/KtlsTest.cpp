@@ -35,10 +35,11 @@
 // user-space TLS connections (knob off) must not touch the ring. Where the kernel provides buffer rings (6.1+ here),
 // receives must be multishot (more completions than submissions) unless --no-multishot, and a connection with too much
 // unread data must pause its receive (so its sender still stalls); --recv-buffers=N shrinks the shared buffer pool so
-// that receives run out of buffers and resume.
+// that receives run out of buffers and resume. A send queued by a WriteSocket-priority task must stay queued until the
+// next react(), or with --submit-after-writes be submitted before lower-priority tasks run.
 //
-//   ktls_unittest [--net-io-uring [--no-multishot] [--recv-buffers=N]] [--main-thread-handshakes]
-//                 [--openssl-conf=tls12|cbc]
+//   ktls_unittest [--net-io-uring [--no-multishot] [--recv-buffers=N] [--submit-after-writes]]
+//                 [--main-thread-handshakes] [--openssl-conf=tls12|cbc]
 
 #include <csignal>
 #include <cstdio>
@@ -410,6 +411,36 @@ Future<Void> exchange(Reference<IConnection> client, Reference<IConnection> serv
 	check(gotUp == up && gotDown == down, label + ": " + std::to_string(size) + " bytes each way intact");
 }
 
+// A write by a WriteSocket-priority task, as FlowTransport's connection writers make, is only queued on the ring. With
+// NET_IO_URING_SUBMIT_AFTER_WRITES the run loop submits it before a lower-priority task of the same pass runs; without
+// it the send stays queued until the next react().
+Future<Void> writeAtWriteSocketPriority(Reference<IConnection> conn, std::string data, unsigned* queuedAfter) {
+	co_await delay(0, TaskPriority::WriteSocket);
+	co_await sendAll(conn, data);
+	*queuedAfter = iouring::Ring::existing()->queued();
+}
+
+Future<Void> observeQueuedAt(unsigned* queued) {
+	co_await delay(0, TaskPriority::DefaultDelay);
+	*queued = iouring::Ring::existing()->queued();
+}
+
+Future<Void> submitAfterWritesCheck(Reference<IConnection> sender, Reference<IConnection> receiver, std::string label) {
+	const std::string data = pattern(100, 7);
+	Future<std::string> got = receiveAll(receiver, data.size());
+	co_await delay(0.05);
+	unsigned queuedAfterWrite = 0, queuedLater = 0;
+	Future<Void> later = observeQueuedAt(&queuedLater);
+	co_await (writeAtWriteSocketPriority(sender, data, &queuedAfterWrite) && later);
+	check((co_await got) == data, label + ": data written at WriteSocket priority arrives intact");
+	check(queuedAfterWrite > 0, label + ": the write left its send queued on the ring");
+	if (FLOW_KNOBS->NET_IO_URING_SUBMIT_AFTER_WRITES) {
+		check(queuedLater == 0, label + ": the send was submitted before a lower-priority task ran");
+	} else {
+		check(queuedLater > 0, label + ": the send stayed queued until the next react()");
+	}
+}
+
 // A plain-OpenSSL client with this process's chain must interoperate with a Net2 server (one side kernel TLS, the
 // other user space); one with a chain from a different root must be rejected by the server's peer verification. A
 // client that can only offer ciphers the server will not accept (kernel TLS mandatory) must be refused either way.
@@ -626,6 +657,9 @@ Future<Void> runOne(bool tls,
 		}
 		check((co_await got) == all, label + ": 1000 small writes intact");
 	}
+	if (expectRing) {
+		co_await submitAfterWritesCheck(client, server, label);
+	}
 	co_await backpressureCheck(client, server, label);
 
 	// A closed peer surfaces as a read error, not a hang.
@@ -728,6 +762,9 @@ int main(int argc, char** argv) {
 		if (arg == "--net-io-uring") {
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING = true;
 			mode += " io_uring";
+		} else if (arg == "--submit-after-writes") {
+			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING_SUBMIT_AFTER_WRITES = true;
+			mode += " submit-after-writes";
 		} else if (arg == "--no-multishot") {
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING_MULTISHOT = false;
 			mode += " no-multishot";
@@ -745,7 +782,8 @@ int main(int argc, char** argv) {
 			kernelCipher = which != "cbc";
 		} else {
 			std::fprintf(stderr,
-			             "usage: %s [--net-io-uring [--no-multishot] [--recv-buffers=N]] [--main-thread-handshakes] "
+			             "usage: %s [--net-io-uring [--no-multishot] [--recv-buffers=N] [--submit-after-writes]] "
+			             "[--main-thread-handshakes] "
 			             "[--openssl-conf=tls12|cbc]\n",
 			             argv[0]);
 			return 2;
