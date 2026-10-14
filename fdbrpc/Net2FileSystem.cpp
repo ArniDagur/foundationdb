@@ -706,8 +706,8 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillGrowthOrdering") {
 		throw err.get();
 	}
 }
-// Writes past the end of a file (as Redwood's pager grows its file) make launch() extend the file before submitting
-// them. With KAIO_ZERO_FILL_GROWTH that extension must not become zero writes over the range those writes fill.
+// Writes past the end of a file, as Redwood's pager grows its file. With KAIO_ZERO_FILL_GROWTH the growth must be zero
+// writes that land before those writes, never on top of them.
 TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillWritePastEnd") {
 	if (g_network->isSimulated()) {
 		co_return;
@@ -751,8 +751,19 @@ TEST_CASE("/fdbrpc/AsyncFileKAIO/ZeroFillWritePastEnd") {
 				}
 			}
 		}
-		printf("KAIO zero fill, writes past the end: %d of %d pages overwritten\n", lost, kPages);
+		const int fd = ::open(filename.c_str(), O_RDONLY | O_CLOEXEC);
+		int64_t unwrittenBytes = 0;
+		for (const auto& [b, e] : AsyncFileKAIO::unwrittenRanges(fd, 4096 + kPages * MB)) {
+			unwrittenBytes += e - b;
+		}
+		::close(fd);
+		printf("KAIO zero fill, writes past the end: %d of %d pages overwritten, %lld unwritten bytes\n",
+		       lost,
+		       kPages,
+		       (long long)unwrittenBytes);
 		ASSERT_EQ(lost, 0);
+		// The growth was written zeros, not unwritten extents.
+		ASSERT_EQ(unwrittenBytes, 0);
 	} catch (Error& e) {
 		err = e;
 	}

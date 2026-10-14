@@ -443,6 +443,11 @@ public:
 		if (failed) {
 			return io_timeout();
 		}
+		// A write past the end grows the file first, with zero writes it then waits for, like truncate() and a write.
+		const int64_t end = offset + length;
+		if (end > lastFileSize && lastFileSize == nextFileSize && mayZeroFill()) {
+			resize((end + 4095) / 4096 * 4096, ZeroFillGrowth::True);
+		}
 		if (waitsForZeroFill(offset, length)) {
 			return writeAfterZeroFill(Reference<AsyncFileKAIO>::addRef(this), zeroFilling, data, length, offset);
 		}
