@@ -1895,19 +1895,6 @@ private:
 
 } // namespace
 
-TEST_CASE("/fdbrpc/genericactors/SendCanceler/CancelWithoutUnwinding") {
-	UnwindObservingFailureMonitor monitor;
-	ScopedFailureMonitor scoped(&monitor);
-
-	ReplyPromise<Void> abandoned;
-	Future<Void> request = sendCanceler(abandoned, nullptr, Endpoint());
-	ASSERT(!request.isReady());
-	request.cancel();
-	ASSERT_EQ(monitor.uncaughtAtRelease, 0);
-	ASSERT(request.isError() && request.getError().code() == error_code_actor_cancelled);
-	return Void();
-}
-
 TEST_CASE("/fdbrpc/genericactors/SendCanceler/Reply") {
 	UnwindObservingFailureMonitor monitor;
 	ScopedFailureMonitor scoped(&monitor);

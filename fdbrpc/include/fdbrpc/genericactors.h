@@ -423,14 +423,9 @@ private:
 	ReliablePacket* send;
 };
 
-// Cancelling a request is routine (quorum stragglers, races), so cancellation destroys this frame instead of throwing
-// actor_cancelled through it; the canceler still withdraws the packet.
+// Not NoThrowOnCancel: destroying this frame mid-race() left a callback on the reply that later ran in freed memory.
 template <class T>
-Future<T> sendCanceler(ReplyPromise<T> reply,
-                       ReliablePacket* send,
-                       Endpoint endpoint,
-                       ExplicitVoid = {},
-                       NoThrowOnCancel = {}) {
+Future<T> sendCanceler(ReplyPromise<T> reply, ReliablePacket* send, Endpoint endpoint, ExplicitVoid = {}) {
 	ReliablePacketCanceler canceler(send);
 	try {
 		while (true) {
