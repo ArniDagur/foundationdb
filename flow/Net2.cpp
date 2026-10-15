@@ -2687,6 +2687,7 @@ void Net2::run() {
 #ifdef __linux__
 	iouring::Ring* const submitRing =
 	    FLOW_KNOBS->NET_IO_URING && FLOW_KNOBS->NET_IO_URING_SUBMIT_AFTER_WRITES ? iouring::Ring::existing() : nullptr;
+	const bool reapAfterWrites = submitRing && FLOW_KNOBS->NET_IO_URING_REAP_AFTER_WRITES;
 #endif
 
 #ifdef WIN32
@@ -2801,6 +2802,12 @@ void Net2::run() {
 			if (submitRing && currentTaskID >= TaskPriority::WriteSocket && submitRing->queued() &&
 			    (!taskQueue.hasReadyTask() || taskQueue.getReadyTaskID() < TaskPriority::WriteSocket)) {
 				submitRing->flush();
+				// The submit's io_uring_enter also posted completions (replies to earlier sends among them); run them
+				// now rather than at the next react(), and submit what they queued (re-armed receives, follow-on
+				// sends).
+				if (reapAfterWrites && submitRing->reap() > 0 && submitRing->queued()) {
+					submitRing->flush();
+				}
 			}
 #endif
 

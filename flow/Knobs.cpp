@@ -166,6 +166,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( NET_IO_URING_MULTISHOT,                             true );
 	init( NET_IO_URING_MAX_QUEUED_BYTES,                   4 << 20 );
 	init( NET_IO_URING_SUBMIT_AFTER_WRITES,                false ); if( randomize && buggify() ) NET_IO_URING_SUBMIT_AFTER_WRITES = true;
+	init( NET_IO_URING_REAP_AFTER_WRITES,                  false ); if( randomize && buggify() ) NET_IO_URING_REAP_AFTER_WRITES = true;
 	init( IO_URING_MAX_WORKERS,                                 16 );
 	init( IO_URING_METRICS_INTERVAL,                           5.0 );
 	init( NETWORK_TEST_CLIENT_COUNT,                            30 );

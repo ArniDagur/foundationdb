@@ -249,6 +249,7 @@ public:
 	                             // receive per connection into its own buffer
 	int NET_IO_URING_MAX_QUEUED_BYTES; // a connection's multishot receive pauses while this much of its data is unread
 	bool NET_IO_URING_SUBMIT_AFTER_WRITES; // submit queued socket sends when WriteSocket-priority tasks give way
+	bool NET_IO_URING_REAP_AFTER_WRITES; // with SUBMIT_AFTER_WRITES, also run the completions that submit posted
 	int IO_URING_MAX_WORKERS; // cap on io-wq worker threads per kind (bounded, unbounded) of the ring
 	double IO_URING_METRICS_INTERVAL; // seconds between IoUringMetrics trace events
 

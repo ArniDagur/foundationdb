@@ -36,9 +36,10 @@
 // receives must be multishot (more completions than submissions) unless --no-multishot, and a connection with too much
 // unread data must pause its receive (so its sender still stalls); --recv-buffers=N shrinks the shared buffer pool so
 // that receives run out of buffers and resume. A send queued by a WriteSocket-priority task must stay queued until the
-// next react(), or with --submit-after-writes be submitted before lower-priority tasks run.
+// next react(), or with --submit-after-writes be submitted before lower-priority tasks run; with --reap-after-writes
+// too, its completion must also be handled before them.
 //
-//   ktls_unittest [--net-io-uring [--no-multishot] [--recv-buffers=N] [--submit-after-writes]]
+//   ktls_unittest [--net-io-uring [--no-multishot] [--recv-buffers=N] [--submit-after-writes [--reap-after-writes]]]
 //                 [--main-thread-handshakes] [--openssl-conf=tls12|cbc]
 
 #include <csignal>
@@ -414,15 +415,20 @@ Future<Void> exchange(Reference<IConnection> client, Reference<IConnection> serv
 // A write by a WriteSocket-priority task, as FlowTransport's connection writers make, is only queued on the ring. With
 // NET_IO_URING_SUBMIT_AFTER_WRITES the run loop submits it before a lower-priority task of the same pass runs; without
 // it the send stays queued until the next react().
-Future<Void> writeAtWriteSocketPriority(Reference<IConnection> conn, std::string data, unsigned* queuedAfter) {
+Future<Void> writeAtWriteSocketPriority(Reference<IConnection> conn,
+                                        std::string data,
+                                        unsigned* queuedAfter,
+                                        int64_t* sendsCompletedAfter) {
 	co_await delay(0, TaskPriority::WriteSocket);
 	co_await sendAll(conn, data);
 	*queuedAfter = iouring::Ring::existing()->queued();
+	*sendsCompletedAfter = ringCount(false, iouring::Kind::NetSend);
 }
 
-Future<Void> observeQueuedAt(unsigned* queued) {
+Future<Void> observeQueuedAt(unsigned* queued, int64_t* sendsCompleted) {
 	co_await delay(0, TaskPriority::DefaultDelay);
 	*queued = iouring::Ring::existing()->queued();
+	*sendsCompleted = ringCount(false, iouring::Kind::NetSend);
 }
 
 Future<Void> submitAfterWritesCheck(Reference<IConnection> sender, Reference<IConnection> receiver, std::string label) {
@@ -430,14 +436,23 @@ Future<Void> submitAfterWritesCheck(Reference<IConnection> sender, Reference<ICo
 	Future<std::string> got = receiveAll(receiver, data.size());
 	co_await delay(0.05);
 	unsigned queuedAfterWrite = 0, queuedLater = 0;
-	Future<Void> later = observeQueuedAt(&queuedLater);
-	co_await (writeAtWriteSocketPriority(sender, data, &queuedAfterWrite) && later);
+	int64_t sendsCompletedAfterWrite = 0, sendsCompletedLater = 0;
+	Future<Void> later = observeQueuedAt(&queuedLater, &sendsCompletedLater);
+	co_await (writeAtWriteSocketPriority(sender, data, &queuedAfterWrite, &sendsCompletedAfterWrite) && later);
 	check((co_await got) == data, label + ": data written at WriteSocket priority arrives intact");
 	check(queuedAfterWrite > 0, label + ": the write left its send queued on the ring");
 	if (FLOW_KNOBS->NET_IO_URING_SUBMIT_AFTER_WRITES) {
 		check(queuedLater == 0, label + ": the send was submitted before a lower-priority task ran");
 	} else {
 		check(queuedLater > 0, label + ": the send stayed queued until the next react()");
+	}
+	// Loopback sends complete inline, so the submit itself posts their completions.
+	if (FLOW_KNOBS->NET_IO_URING_SUBMIT_AFTER_WRITES && FLOW_KNOBS->NET_IO_URING_REAP_AFTER_WRITES) {
+		check(sendsCompletedLater > sendsCompletedAfterWrite,
+		      label + ": the send's completion was handled before a lower-priority task ran");
+	} else {
+		check(sendsCompletedLater == sendsCompletedAfterWrite,
+		      label + ": the send's completion waited for the next react()");
 	}
 }
 
@@ -765,6 +780,9 @@ int main(int argc, char** argv) {
 		} else if (arg == "--submit-after-writes") {
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING_SUBMIT_AFTER_WRITES = true;
 			mode += " submit-after-writes";
+		} else if (arg == "--reap-after-writes") {
+			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING_REAP_AFTER_WRITES = true;
+			mode += " reap-after-writes";
 		} else if (arg == "--no-multishot") {
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING_MULTISHOT = false;
 			mode += " no-multishot";
@@ -782,7 +800,8 @@ int main(int argc, char** argv) {
 			kernelCipher = which != "cbc";
 		} else {
 			std::fprintf(stderr,
-			             "usage: %s [--net-io-uring [--no-multishot] [--recv-buffers=N] [--submit-after-writes]] "
+			             "usage: %s [--net-io-uring [--no-multishot] [--recv-buffers=N] [--submit-after-writes "
+			             "[--reap-after-writes]]] "
 			             "[--main-thread-handshakes] "
 			             "[--openssl-conf=tls12|cbc]\n",
 			             argv[0]);
