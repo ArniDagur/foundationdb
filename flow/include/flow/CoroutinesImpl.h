@@ -236,7 +236,15 @@ struct NoThrowOnCancelCoroActor final : Actor<std::conditional_t<std::is_void_v<
 		}
 
 		// Detaching a waiter or destroying the frame can synchronously reenter cancellation.
+		const auto prevWaitState = Actor<ValType>::actor_wait_state;
 		Actor<ValType>::actor_wait_state = ACTOR_WAIT_STATE_CANCELLED;
+
+		// Not suspended: the cancel comes from code the coroutine itself is running (e.g. a callback it fired dropped
+		// the last Future), so its frame is still on the stack. As with CoroActor, its next co_await observes the
+		// cancellation, and if it completes first its frame and this actor are freed then.
+		if (!actorWaitStateIsWaiting(prevWaitState)) {
+			return;
+		}
 
 		if (cancelHandler) {
 			// The handler object is stored in the coroutine frame, so unregister
