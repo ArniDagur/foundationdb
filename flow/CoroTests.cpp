@@ -2189,6 +2189,52 @@ Future<Void> noThrowOnCancelReentrantCancelTest(Future<Void>* result,
 	co_await signal;
 }
 
+// Observations of the coroutines below, kept outside their frames so that they stay readable whatever happens to
+// those frames.
+struct NoThrowOnCancelSelfDropObservations {
+	bool frameDestroyed = false;
+	bool frameDestroyedWhileRunning = false;
+	bool resumedAfterCancel = false;
+};
+NoThrowOnCancelSelfDropObservations selfDrop;
+
+struct NoThrowOnCancelFrameMarker {
+	~NoThrowOnCancelFrameMarker() { selfDrop.frameDestroyed = true; }
+};
+
+// The pattern that crashed sendCanceler: its catch block calls code (IFailureMonitor::endpointNotFound) that
+// synchronously drops the last reference to this coroutine's Future, and then keeps running in the same frame.
+Future<Void> noThrowOnCancelDropsSelfInCatch(Future<Void>* self, Future<Void> signal, NoThrowOnCancel = {}) {
+	NoThrowOnCancelFrameMarker marker;
+	try {
+		co_await signal;
+	} catch (Error&) {
+		*self = Future<Void>();
+		selfDrop.frameDestroyedWhileRunning = selfDrop.frameDestroyed;
+		throw;
+	}
+}
+
+Future<int> noThrowOnCancelDropsSelfAfterResume(Future<int>* self, Future<Void> signal, NoThrowOnCancel = {}) {
+	NoThrowOnCancelFrameMarker marker;
+	co_await signal;
+	*self = Future<int>();
+	selfDrop.frameDestroyedWhileRunning = selfDrop.frameDestroyed;
+	co_return 7;
+}
+
+Future<Void> noThrowOnCancelCancelsSelfThenAwaits(Future<Void>* self,
+                                                  Future<Void> first,
+                                                  Future<Void> second,
+                                                  NoThrowOnCancel = {}) {
+	NoThrowOnCancelFrameMarker marker;
+	co_await first;
+	self->cancel();
+	selfDrop.frameDestroyedWhileRunning = selfDrop.frameDestroyed;
+	co_await second;
+	selfDrop.resumedAfterCancel = true;
+}
+
 Future<int> noThrowOnCancelValueTest(NoThrowOnCancelRecorder& recorder, Future<Void> signal, NoThrowOnCancel = {}) {
 	recorder.record(NoThrowOnCancelEvent::Start);
 
@@ -2893,6 +2939,48 @@ TEST_CASE("/flow/coro/noThrowOnCancel/reentrantCancelDuringCleanup") {
 
 	result.cancel();
 	ASSERT_EQ(cleanupCount, 1);
+	return Void();
+}
+
+// Dropping the last Future of a running NoThrowOnCancel coroutine must not destroy its frame under it: the coroutine
+// finishes in its frame, which is freed when it completes.
+TEST_CASE("/flow/coro/noThrowOnCancel/dropLastFutureWhileRunningInCatch") {
+	selfDrop = {};
+	Promise<Void> signal;
+	Future<Void> f = noThrowOnCancelDropsSelfInCatch(&f, signal.getFuture());
+	signal.sendError(io_error());
+	ASSERT(!selfDrop.frameDestroyedWhileRunning);
+	ASSERT(selfDrop.frameDestroyed);
+	ASSERT(!f.isValid());
+	ASSERT_EQ(signal.getFutureReferenceCount(), 0);
+	return Void();
+}
+
+TEST_CASE("/flow/coro/noThrowOnCancel/dropLastFutureWhileRunning") {
+	selfDrop = {};
+	Promise<Void> signal;
+	Future<int> f = noThrowOnCancelDropsSelfAfterResume(&f, signal.getFuture());
+	signal.send(Void());
+	ASSERT(!selfDrop.frameDestroyedWhileRunning);
+	ASSERT(selfDrop.frameDestroyed);
+	ASSERT(!f.isValid());
+	ASSERT_EQ(signal.getFutureReferenceCount(), 0);
+	return Void();
+}
+
+// Cancelled while running, the coroutine sees the cancellation at its next co_await, like other coroutines.
+TEST_CASE("/flow/coro/noThrowOnCancel/cancelWhileRunningThenAwait") {
+	selfDrop = {};
+	Promise<Void> first;
+	Promise<Void> second;
+	Future<Void> f = noThrowOnCancelCancelsSelfThenAwaits(&f, first.getFuture(), second.getFuture());
+	Future<Void> observer = f;
+	first.send(Void());
+	ASSERT(!selfDrop.frameDestroyedWhileRunning);
+	ASSERT(!selfDrop.resumedAfterCancel);
+	ASSERT(selfDrop.frameDestroyed);
+	ASSERT(observer.isReady() && observer.isError() && observer.getError().code() == error_code_actor_cancelled);
+	ASSERT_EQ(second.getFutureReferenceCount(), 0);
 	return Void();
 }
 
