@@ -5355,11 +5355,13 @@ Future<GetReadVersionReply> getConsistentReadVersion(SpanContext parentSpan,
 	}
 }
 
+// Sends one batch of `count` read version requests (with the batch's tags and debug ID) and returns its reply.
+using SendReadVersionBatch =
+    std::function<Future<GetReadVersionReply>(SpanContext, uint32_t, TransactionTagMap<uint32_t>, Optional<UID>)>;
+
 Future<Void> readVersionBatcher(DatabaseContext* cx,
                                 FutureStream<DatabaseContext::VersionRequest> versionStreamInput,
-                                TransactionPriority priority,
-                                uint32_t flags,
-                                Optional<int64_t> maxGrvQueueDelayMS) {
+                                SendReadVersionBatch sendBatch) {
 	FutureStream<DatabaseContext::VersionRequest> versionStream(std::move(versionStreamInput));
 	std::vector<Promise<GetReadVersionReply>> requests;
 	PromiseStream<Future<Void>> addActor;
@@ -5376,6 +5378,8 @@ Future<Void> readVersionBatcher(DatabaseContext* cx,
 	Reference<Histogram> grvReplyLatencyDist =
 	    Histogram::getHistogram("GrvBatcher"_sr, "ClientGrvReplyLatency"_sr, Histogram::Unit::milliseconds);
 	double lastRequestTime = now();
+	// Readiness of the most recent batch's reply (GRV_BATCH_WAIT_FOR_REPLY).
+	Future<Void> previousReply = Void();
 
 	TransactionTagMap<uint32_t> tags;
 
@@ -5412,11 +5416,25 @@ Future<Void> readVersionBatcher(DatabaseContext* cx,
 					send_batch = true;
 					++cx->transactionGrvFullBatches;
 				} else if (!timeout.isValid()) {
-					timeout = delay(batchTime, TaskPriority::GetConsistentReadVersion);
+					if (CLIENT_KNOBS->GRV_BATCH_WAIT_FOR_REPLY) {
+						// One batch in flight at a time: send with this pass's other requests if none is outstanding,
+						// else when the outstanding one's reply arrives. No batch timer is needed to bound the request
+						// rate.
+						timeout =
+						    previousReply.isReady() ? delay(0, TaskPriority::GetConsistentReadVersion) : previousReply;
+					} else {
+						timeout = delay(batchTime, TaskPriority::GetConsistentReadVersion);
+					}
 				}
 			} else if (res.index() == 1) {
-				send_batch = true;
-				++cx->transactionGrvTimedOutBatches;
+				if (CLIENT_KNOBS->GRV_BATCH_WAIT_FOR_REPLY && !previousReply.isReady()) {
+					// Sending now would only add a request to a GRV proxy that is still answering the last one; the
+					// batch keeps growing until that reply arrives, then goes out at once.
+					timeout = previousReply;
+				} else {
+					send_batch = true;
+					++cx->transactionGrvTimedOutBatches;
+				}
 			} else if (res.index() == 2) {
 				// Dynamic batching monitors reply latencies.
 				double reply_latency = std::get<2>(std::move(res));
@@ -5439,12 +5457,11 @@ Future<Void> readVersionBatcher(DatabaseContext* cx,
 			Promise<GetReadVersionReply> GRVReply;
 			requests.push_back(GRVReply);
 			addActor.send(ready(timeReply(GRVReply.getFuture(), replyTimes)));
+			previousReply = ready(GRVReply.getFuture());
 
-			Future<Void> batch = incrementalBroadcastWithError(
-			    getConsistentReadVersion(
-			        span.context, cx, count, priority, flags, std::move(tags), debugID, maxGrvQueueDelayMS),
-			    std::move(requests),
-			    CLIENT_KNOBS->BROADCAST_BATCH_SIZE);
+			Future<Void> batch = incrementalBroadcastWithError(sendBatch(span.context, count, std::move(tags), debugID),
+			                                                   std::move(requests),
+			                                                   CLIENT_KNOBS->BROADCAST_BATCH_SIZE);
 
 			span = Span("NAPI:readVersionBatcher"_loc);
 			tags.clear();
@@ -5453,6 +5470,85 @@ Future<Void> readVersionBatcher(DatabaseContext* cx,
 			addActor.send(batch);
 			timeout = Future<Void>();
 		}
+	}
+}
+
+// GRV_BATCH_WAIT_FOR_REPLY: requests whose batch timer fires while the previous batch's reply is outstanding go out
+// together once it arrives; without the knob each timer firing sends its own batch.
+TEST_CASE("/fdbclient/NativeAPI/readVersionBatcher/waitForPreviousReply") {
+	const bool savedWait = CLIENT_KNOBS->GRV_BATCH_WAIT_FOR_REPLY;
+	const double savedTimeout = CLIENT_KNOBS->GRV_BATCH_TIMEOUT;
+	ScopeExit restore([savedWait, savedTimeout]() {
+		const_cast<ClientKnobs*>(CLIENT_KNOBS)->GRV_BATCH_WAIT_FOR_REPLY = savedWait;
+		const_cast<ClientKnobs*>(CLIENT_KNOBS)->GRV_BATCH_TIMEOUT = savedTimeout;
+	});
+	for (bool wait : { false, true }) {
+		const_cast<ClientKnobs*>(CLIENT_KNOBS)->GRV_BATCH_WAIT_FOR_REPLY = wait;
+		const_cast<ClientKnobs*>(CLIENT_KNOBS)->GRV_BATCH_TIMEOUT = 10.0;
+		DatabaseContext cx(operation_failed());
+		PromiseStream<DatabaseContext::VersionRequest> stream;
+		std::vector<uint32_t> batchSizes;
+		std::vector<Promise<GetReadVersionReply>> proxyReplies;
+		Future<Void> batcher =
+		    readVersionBatcher(&cx,
+		                       stream.getFuture(),
+		                       [&](SpanContext, uint32_t count, TransactionTagMap<uint32_t>, Optional<UID>)
+		                           -> Future<GetReadVersionReply> {
+			                       batchSizes.push_back(count);
+			                       proxyReplies.emplace_back();
+			                       return proxyReplies.back().getFuture();
+		                       });
+		std::vector<Future<GetReadVersionReply>> replies;
+		auto request = [&]() {
+			DatabaseContext::VersionRequest req{ SpanContext() };
+			replies.push_back(req.reply.getFuture());
+			stream.send(req);
+		};
+
+		request();
+		co_await delay(0.01);
+		ASSERT_EQ(batchSizes.size(), 1);
+		// Three more requests, each given time for its batch timer to fire, while the first reply is outstanding.
+		for (int i = 0; i < 3; i++) {
+			request();
+			co_await delay(0.01);
+		}
+		ASSERT_EQ(batchSizes.size(), wait ? 1 : 4);
+
+		// A slow first reply raises the batch timer (half the smoothed reply latency) well above 0.01 s.
+		co_await delay(1.0);
+		GetReadVersionReply rep;
+		rep.version = 100;
+		proxyReplies[0].send(rep);
+		co_await delay(0.01);
+		if (wait) {
+			ASSERT_EQ(batchSizes.size(), 2);
+			ASSERT_EQ(batchSizes[1], 3);
+		}
+		for (int i = 1; i < proxyReplies.size(); i++) {
+			rep.version = 100 + i;
+			proxyReplies[i].send(rep);
+		}
+		co_await delay(0.01);
+		for (auto& r : replies) {
+			ASSERT(r.isReady() && !r.isError() && r.get().version >= 100);
+		}
+
+		// With nothing outstanding, a request goes out at once with the knob; without it, it waits for the batch
+		// timer, which the slow first reply raised well past 0.01 s.
+		const size_t before = batchSizes.size();
+		request();
+		co_await delay(0.01);
+		ASSERT_EQ(batchSizes.size(), wait ? before + 1 : before);
+		co_await delay(1.0);
+		for (auto& p : proxyReplies) {
+			if (!p.isSet()) {
+				p.send(rep);
+			}
+		}
+		co_await delay(0.01);
+		ASSERT(replies.back().isReady() && !replies.back().isError());
+		batcher.cancel();
 	}
 }
 
@@ -5715,8 +5811,15 @@ Future<Version> TransactionState::getReadVersion(uint32_t flags) {
 	// share the same proxy-side admission threshold.
 	auto& batcher = cx->versionBatcher[DatabaseContext::VersionBatcherKey(flags, options.maxGrvQueueDelayMS)];
 	if (!batcher.actor.isValid()) {
+		DatabaseContext* db = cx.getPtr();
 		batcher.actor = readVersionBatcher(
-		    cx.getPtr(), batcher.stream.getFuture(), options.priority, flags, options.maxGrvQueueDelayMS);
+		    db,
+		    batcher.stream.getFuture(),
+		    [db, priority = options.priority, flags, maxGrvQueueDelayMS = options.maxGrvQueueDelayMS](
+		        SpanContext span, uint32_t count, TransactionTagMap<uint32_t> tags, Optional<UID> debugID) {
+			    return getConsistentReadVersion(
+			        span, db, count, priority, flags, std::move(tags), debugID, maxGrvQueueDelayMS);
+		    });
 	}
 
 	auto const req = DatabaseContext::VersionRequest(derivedSpanContext, options.tags, versionDebugID);

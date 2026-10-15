@@ -203,6 +203,7 @@ void ClientKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 
 	init( MAX_BATCH_SIZE,                         1000 ); if( randomize && buggify() ) MAX_BATCH_SIZE = 1;
 	init( GRV_BATCH_TIMEOUT,                     0.005 ); if( randomize && buggify() ) GRV_BATCH_TIMEOUT = 0.1;
+	init( GRV_BATCH_WAIT_FOR_REPLY,                 false ); if( randomize && buggify() ) GRV_BATCH_WAIT_FOR_REPLY = true;
 	init( BROADCAST_BATCH_SIZE,                     20 ); if( randomize && buggify() ) BROADCAST_BATCH_SIZE = 1;
 	init( TRANSACTION_TIMEOUT_DELAY_INTERVAL,     10.0 ); if( randomize && buggify() ) TRANSACTION_TIMEOUT_DELAY_INTERVAL = 1.0;
 

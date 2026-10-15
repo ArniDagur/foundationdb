@@ -110,6 +110,7 @@ public:
 
 	int MAX_BATCH_SIZE;
 	double GRV_BATCH_TIMEOUT;
+	bool GRV_BATCH_WAIT_FOR_REPLY; // one GRV batch in flight per batcher; the next is sent when its reply arrives
 	int BROADCAST_BATCH_SIZE;
 	double TRANSACTION_TIMEOUT_DELAY_INTERVAL;
 
