@@ -1977,7 +1977,8 @@ public:
 		Future<Reference<const ArenaPage>> readOnlyFuture;
 		Future<Void> writeFuture;
 
-		static Future<Reference<const ArenaPage>> makeReadOnlyFutureSlow(Future<Reference<ArenaPage>> future) {
+		static Future<Reference<const ArenaPage>> makeReadOnlyFutureSlow(Future<Reference<ArenaPage>> future,
+		                                                                 NoThrowOnCancel = {}) {
 			Reference<ArenaPage> page = co_await future;
 			co_return Reference<const ArenaPage>(std::move(page));
 		}
@@ -10046,6 +10047,36 @@ TEST_CASE("/redwood/correctness/unit/readOnlyPageFuture") {
 	ASSERT(survivingRead.isReady() && !survivingRead.isError());
 	ASSERT_EQ(survivingRead.get()->dataAsStringRef().substr(0, expectedPageContents.size()), expectedPageContents);
 
+	return Void();
+}
+
+static Future<Void> pageReadRefsWhenCancelled(Future<Reference<const ArenaPage>> waiter,
+                                              Promise<Reference<ArenaPage>> read,
+                                              int* refs) {
+	try {
+		co_await waiter;
+	} catch (Error& e) {
+		ASSERT_EQ(e.code(), error_code_actor_cancelled);
+		*refs = read.getFutureReferenceCount();
+	}
+}
+
+TEST_CASE("/redwood/correctness/unit/readOnlyPageFutureCancel") {
+	DWALPager::PageCacheEntry entry;
+	Promise<Reference<ArenaPage>> read;
+	entry.setReadFuture(read.getFuture());
+	Future<Reference<const ArenaPage>> waiter = entry.getReadFuture<true>();
+	int refs = -1;
+	Future<Void> observer = pageReadRefsWhenCancelled(waiter, read, &refs);
+
+	// Prefetches drop such waiters on most range reads. A cancelled waiter is torn down without being resumed to
+	// throw actor_cancelled, so it has let go of the read by the time its other holders see the cancellation.
+	waiter.cancel();
+	ASSERT(observer.isReady());
+	ASSERT_EQ(refs, 1);
+
+	read.send(makeReference<ArenaPage>(4096, 4096));
+	ASSERT(entry.getReadFuture<true>().isReady());
 	return Void();
 }
 
