@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <iterator>
@@ -1168,6 +1169,48 @@ TEST_CASE("/flow/coro/YieldedAsyncMap/cancel") {
 	ASSERT(y1b.getError().code() == error_code_actor_cancelled);
 	ASSERT(yam.count(1) == 0);
 
+	return Void();
+}
+
+namespace {
+
+int keyComparisonsWhileHandlingException = 0;
+
+struct ExceptionObservingKey {
+	int value;
+	bool operator<(ExceptionObservingKey const& rhs) const {
+		if (std::current_exception()) {
+			++keyComparisonsWhileHandlingException;
+		}
+		return value < rhs.value;
+	}
+};
+
+template <class Map>
+void checkCancelledWaitersEraseWithoutThrowing() {
+	keyComparisonsWhileHandlingException = 0;
+	const ExceptionObservingKey key{ 1 };
+	Map map;
+	Future<Void> first = map.onChange(key);
+	Future<Void> last = map.onChange(key);
+	ASSERT_EQ(map.count(key), 1);
+	first.cancel();
+	ASSERT(first.isError() && first.getError().code() == error_code_actor_cancelled);
+	ASSERT_EQ(map.count(key), 1);
+	last = Future<Void>();
+	ASSERT_EQ(map.count(key), 0);
+	// The item is erased by the cancelled waiter; a catch block doing it would compare keys with an exception in
+	// flight.
+	ASSERT_EQ(keyComparisonsWhileHandlingException, 0);
+}
+
+} // namespace
+
+// waitValueOrSignal drops its failure-monitor onChange() future on every reply; cancelling it must erase the item
+// without throwing actor_cancelled through the waiting coroutine.
+TEST_CASE("/flow/coro/AsyncMap/cancelWithoutThrowing") {
+	checkCancelledWaitersEraseWithoutThrowing<AsyncMap<ExceptionObservingKey, int>>();
+	checkCancelledWaitersEraseWithoutThrowing<YieldedAsyncMap<ExceptionObservingKey, int>>();
 	return Void();
 }
 

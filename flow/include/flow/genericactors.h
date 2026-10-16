@@ -39,6 +39,7 @@
 #include "flow/Knobs.h"
 #include "flow/Util.h"
 #include "flow/IndexedSet.h"
+#include "flow/ScopeExit.h"
 
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
@@ -632,22 +633,31 @@ protected:
 		trigger.send(Void());
 	}
 
-	Future<Void> destroyOnCancel(AsyncMap* self, K key, Future<Void> change) {
+	// Waiters routinely drop this future (waitValueOrSignal does on every reply), so it is cancelled without
+	// unwinding: destroying the cancelled frame erases the key's item instead of a catch block.
+	Future<Void> destroyOnCancel(AsyncMap* self, K key, Future<Void> change, NoThrowOnCancel = {}) {
+		ScopeExit eraseIfCancelled([&]() { self->eraseIfUnwatched(key, change); });
 		try {
 			co_await change;
-			change = Future<Void>();
-		} catch (Error& e) {
-			if (e.code() == error_code_actor_cancelled && !self->destructing && change.getFutureReferenceCount() == 1 &&
-			    change.getPromiseReferenceCount() == 1) {
-				if (EXPENSIVE_VALIDATION) {
-					auto& p = self->items[key];
-					ASSERT(p.change.getFuture() == change);
-				}
-				self->items.erase(key);
-			}
+		} catch (Error&) {
 			change = Future<Void>();
 			throw;
 		}
+		change = Future<Void>();
+	}
+
+	// For a cancelled onChange() waiter, whose `change` is still set: erases the key's item if no one else waits
+	// on it.
+	void eraseIfUnwatched(K const& key, Future<Void>& change) {
+		if (change.isValid() && !destructing && change.getFutureReferenceCount() == 1 &&
+		    change.getPromiseReferenceCount() == 1) {
+			if (EXPENSIVE_VALIDATION) {
+				auto& p = items[key];
+				ASSERT(p.change.getFuture() == change);
+			}
+			items.erase(key);
+		}
+		change = Future<Void>();
 	}
 };
 
@@ -2374,25 +2384,22 @@ public:
 		return yieldedFuture(item.change.getFuture());
 	}
 
-	static Future<Void> destroyOnCancelYield(YieldedAsyncMap* self, K key, Future<Void> change) {
+	// Cancelled without unwinding, like AsyncMap::destroyOnCancel.
+	static Future<Void> destroyOnCancelYield(YieldedAsyncMap* self, K key, Future<Void> change, NoThrowOnCancel = {}) {
 		Future<Void> yielded = yieldedFuture(change);
+		ScopeExit eraseIfCancelled([&]() {
+			yielded = Future<Void>();
+			self->eraseIfUnwatched(key, change);
+		});
 		try {
 			co_await yielded;
+		} catch (Error&) {
 			yielded = Future<Void>();
-			change = Future<Void>();
-		} catch (Error& e) {
-			yielded = Future<Void>();
-			if (e.code() == error_code_actor_cancelled && !self->destructing && change.getFutureReferenceCount() == 1 &&
-			    change.getPromiseReferenceCount() == 1) {
-				if (EXPENSIVE_VALIDATION) {
-					auto& p = self->items[key];
-					ASSERT(p.change.getFuture() == change);
-				}
-				self->items.erase(key);
-			}
 			change = Future<Void>();
 			throw;
 		}
+		yielded = Future<Void>();
+		change = Future<Void>();
 	}
 };
 
