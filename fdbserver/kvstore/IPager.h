@@ -34,6 +34,7 @@
 
 #define XXH_INLINE_ALL
 #include "flow/xxhash.h"
+#include "PageChecksum.h"
 
 #include <array>
 #include <cstddef>
@@ -322,12 +323,12 @@ public:
 
 		static void encode(void* header, uint8_t* payload, int len, PhysicalPageID seed) {
 			Header* h = reinterpret_cast<Header*>(header);
-			h->checksum = XXH3_64bits_withSeed(payload, len, seed);
+			h->checksum = pagePayloadChecksum(payload, len, seed);
 		}
 
 		static void decode(void* header, uint8_t* payload, int len, PhysicalPageID seed) {
 			Header* h = reinterpret_cast<Header*>(header);
-			if (h->checksum != XXH3_64bits_withSeed(payload, len, seed)) {
+			if (h->checksum != pagePayloadChecksum(payload, len, seed)) {
 				throw page_decoding_failed();
 			}
 		}
@@ -343,7 +344,7 @@ public:
 
 		static void encode(void* header, uint8_t xorWith, uint8_t* payload, int len, PhysicalPageID seed) {
 			Header* h = reinterpret_cast<Header*>(header);
-			h->checksum = XXH3_64bits_withSeed(payload, len, seed);
+			h->checksum = pagePayloadChecksum(payload, len, seed);
 			h->xorKey =
 			    static_cast<uint8_t>(deterministicRandom()->randomInt(0, std::numeric_limits<uint8_t>::max() + 1));
 			uint8_t xorMask = static_cast<uint8_t>(~h->xorKey) ^ xorWith;
@@ -358,7 +359,7 @@ public:
 			for (int i = 0; i < len; ++i) {
 				payload[i] ^= xorMask;
 			}
-			if (h->checksum != XXH3_64bits_withSeed(payload, len, seed)) {
+			if (h->checksum != pagePayloadChecksum(payload, len, seed)) {
 				throw page_decoding_failed();
 			}
 		}
