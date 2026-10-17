@@ -525,6 +525,41 @@ public:
 		armReceive();
 	}
 
+	// Hands the oldest received bytes (at most one buffer's worth) to sink(data, length) and returns how many; 0 when
+	// none have arrived yet (a receive is then in flight). After EOF or an error returns -1 with errnum set (0 for
+	// EOF). Unlike read(), the bytes are not copied into a caller's buffer first.
+	template <class Sink>
+	int feed(Sink&& sink, int& errnum) {
+		size_t moved = 0;
+		if (multishot) {
+			if (!rxChunks.empty()) {
+				const RxChunk c = rxChunks.front();
+				rxChunks.pop_front();
+				moved = c.len - c.off;
+				sink(ring->bufferData(c.bid) + c.off, moved);
+				ring->recycleBuffer(c.bid);
+			}
+			if (rxPaused && rxChunks.empty() && !rxPending) {
+				rxPaused = false;
+				armReceive();
+			}
+		} else if (rxEnd > rxBegin) {
+			moved = rxEnd - rxBegin;
+			sink(rxBuf.data() + rxBegin, moved);
+			rxBegin = rxEnd = 0;
+			armReceive();
+		}
+		if (moved > 0) {
+			return moved;
+		}
+		if (rxDone) {
+			errnum = rxErrno;
+			return -1;
+		}
+		armReceive();
+		return 0;
+	}
+
 	Future<Void> onReadable() {
 		if (hasReceived() || rxDone || rxControl) {
 			return Void();
@@ -1635,6 +1670,42 @@ static constexpr const char* kKernelTlsCiphersuites =
 static constexpr const char* kKernelTlsCiphers = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
                                                  "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
                                                  "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+
+// A pass-through BIO for OpenSSL's read side that declines kernel TLS, so the receive keys stay in OpenSSL
+// (FLOW_KNOBS->TLS_USERSPACE_RECV) while the socket BIO on the write side takes the send keys.
+static BIO_METHOD* noKernelTlsFilter() {
+	static BIO_METHOD* const method = [] {
+		BIO_METHOD* m = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_FILTER, "fdb read without kernel TLS");
+		BIO_meth_set_read(m, [](BIO* b, char* out, int len) {
+			BIO_clear_retry_flags(b);
+			const int n = BIO_read(BIO_next(b), out, len);
+			BIO_copy_next_retry(b);
+			return n;
+		});
+		BIO_meth_set_write(m, [](BIO* b, const char* in, int len) {
+			BIO_clear_retry_flags(b);
+			const int n = BIO_write(BIO_next(b), in, len);
+			BIO_copy_next_retry(b);
+			return n;
+		});
+		BIO_meth_set_ctrl(m, [](BIO* b, int cmd, long num, void* ptr) -> long {
+			switch (cmd) {
+			case 72: // BIO_CTRL_SET_KTLS, which OpenSSL reserves in its public header but keeps internal
+			case BIO_CTRL_GET_KTLS_SEND:
+			case BIO_CTRL_GET_KTLS_RECV:
+				return 0;
+			default:
+				return BIO_ctrl(BIO_next(b), cmd, num, ptr);
+			}
+		});
+		BIO_meth_set_create(m, [](BIO* b) {
+			BIO_set_init(b, 1);
+			return 1;
+		});
+		return m;
+	}();
+	return method;
+}
 #endif
 
 class SSLConnection final : public IConnection, ReferenceCounted<SSLConnection> {
@@ -1977,7 +2048,9 @@ public:
 		++g_net2->countReadProbes;
 #ifdef __linux__
 		if (uring) {
-			if (SSL_pending(ssl_sock.native_handle()) > 0) {
+			// rxBio may hold whole records past what the last read() returned; after a read() of 0 it holds at most
+			// part of one.
+			if (SSL_pending(ssl_sock.native_handle()) > 0 || (rxBio && !rxBioPartial && BIO_ctrl_pending(rxBio) > 0)) {
 				return Void();
 			}
 			return uring->onReadable();
@@ -2002,6 +2075,9 @@ public:
 		if (uring) {
 			int errnum = 0;
 			int n = 0;
+			if (rxBio) {
+				return readUserspaceRecv(begin, toRead);
+			}
 			// SSL_read past a control record (below) returns at most toRead bytes of the application record after it;
 			// OpenSSL keeps the rest, which precedes everything still in the kernel.
 			if (SSL_pending(ssl_sock.native_handle()) > 0) {
@@ -2149,9 +2225,12 @@ private:
 	// Set after the handshake: the kernel encrypts sends, so writes bypass OpenSSL.
 	bool ktlsSend = false;
 #ifdef __linux__
-	// With FLOW_KNOBS->NET_IO_URING, once the kernel encrypts and decrypts both directions.
+	// With FLOW_KNOBS->NET_IO_URING, once the kernel encrypts sends (and decrypts receives unless TLS_USERSPACE_RECV).
 	Reference<UringSocket> uring;
 	bool ringMode = false; // created through the ring; Asio's reactor never watches it
+	// With TLS_USERSPACE_RECV: OpenSSL's read side (owned by the SSL object), holding received bytes not yet decrypted.
+	BIO* rxBio = nullptr;
+	bool rxBioPartial = false; // the last read() returned 0: rxBio holds less than a record
 #endif
 
 	void init() {
@@ -2190,6 +2269,16 @@ private:
 			TraceEvent(SevWarnAlways, "N2_KernelTLSSetFdFailed", id).suppressFor(60.0);
 			throw connection_failed();
 		}
+		if (FLOW_KNOBS->TLS_USERSPACE_RECV) {
+			BIO* read = BIO_new(noKernelTlsFilter());
+			BIO* sock = BIO_new_socket(socket.native_handle(), BIO_NOCLOSE);
+			if (!read || !sock) {
+				BIO_free(read);
+				BIO_free(sock);
+				throw connection_failed();
+			}
+			SSL_set0_rbio(ssl, BIO_push(read, sock));
+		}
 #else
 		TraceEvent(SevWarnAlways, "N2_KernelTLSUnsupported", id).suppressFor(60.0);
 		throw connection_failed();
@@ -2220,18 +2309,28 @@ private:
 			    setsockopt(
 			        socket.native_handle(), 282 /* SOL_TLS */, 4 /* TLS_RX_EXPECT_NO_PAD */, &one, sizeof(one)) == 0);
 		}
-		TraceEvent(ktlsSend && ktlsRecv ? SevInfo : SevWarnAlways, "N2_TLSKernelOffload", id)
-		    .suppressFor(ktlsSend && ktlsRecv ? 60.0 : 1.0)
+		const bool offloaded = ktlsSend && (ktlsRecv == !FLOW_KNOBS->TLS_USERSPACE_RECV);
+		TraceEvent(offloaded ? SevInfo : SevWarnAlways, "N2_TLSKernelOffload", id)
+		    .suppressFor(offloaded ? 60.0 : 1.0)
 		    .detail("PeerAddress", peer_address)
 		    .detail("Version", SSL_get_version(ssl))
 		    .detail("Cipher", SSL_get_cipher(ssl))
 		    .detail("Send", ktlsSend)
 		    .detail("Recv", ktlsRecv);
-		if (!(ktlsSend && ktlsRecv)) {
+		if (!offloaded) {
 			throw connection_failed(); // kernel TLS is mandatory with the knob (prepareKtls())
 		}
-		// Application data is now plain socket I/O.
+		// Application data is now plain socket I/O, except that with TLS_USERSPACE_RECV OpenSSL decrypts what arrives.
 		uring = makeUringSocket(socket.native_handle(), /*kernelTls=*/true);
+		if (uring && !ktlsRecv) {
+			// The handshake read whole records, so the ring's receives start at a record boundary.
+			rxBio = BIO_new(BIO_s_mem());
+			if (!rxBio) {
+				throw connection_failed();
+			}
+			BIO_set_mem_eof_return(rxBio, -1);
+			SSL_set0_rbio(ssl, rxBio);
+		}
 #endif
 	}
 
@@ -2276,6 +2375,42 @@ private:
 		const size_t n = opensslRead(begin, toRead, err);
 		fcntl(fd, F_SETFL, flags);
 		return n;
+	}
+#endif
+
+#ifdef __linux__
+	// Reads with TLS_USERSPACE_RECV: OpenSSL decrypts from rxBio, which is topped up from the ring whenever OpenSSL
+	// needs more of a record, so unread data stays in the ring's buffers (and its receive pauses) as without it.
+	int readUserspaceRecv(uint8_t* begin, size_t toRead) {
+		boost::system::error_code err;
+		while (true) {
+			const size_t n = opensslRead(begin, toRead, err);
+			if (n > 0) {
+				rxBioPartial = false;
+				g_net2->bytesReceived += n;
+				return n;
+			}
+			if (err != boost::asio::error::would_block) {
+				onReadError(err);
+				throw connection_failed();
+			}
+			int errnum = 0;
+			bool stored = true;
+			const int fed =
+			    uring->feed([&](const uint8_t* data,
+			                    size_t len) { stored = BIO_write(rxBio, data, static_cast<int>(len)) == int(len); },
+			                errnum);
+			if (fed == 0) {
+				rxBioPartial = true;
+				++g_net2->countWouldBlock;
+				return 0;
+			}
+			if (fed < 0 || !stored) {
+				onReadError(errnum ? boost::system::error_code(errnum, boost::system::system_category())
+				                   : boost::system::error_code(boost::asio::error::eof));
+				throw connection_failed();
+			}
+		}
 	}
 #endif
 

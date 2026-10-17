@@ -235,6 +235,9 @@ public:
 	// built with kTLS support and the Linux tls module; each direction of a connection falls back to user-space TLS
 	// when the kernel does not support the negotiated cipher.
 	bool TLS_USE_KTLS;
+	// With TLS_USE_KTLS, only sends go through kernel TLS: OpenSSL decrypts received records (from io_uring's receive
+	// buffers with NET_IO_URING), which costs far less per small record than the kernel's decryption.
+	bool TLS_USERSPACE_RECV;
 	// Proof of concept: socket I/O of TCP connections (and of TLS connections whose records the kernel encrypts and
 	// decrypts) goes through the network thread's io_uring, and the run loop waits on the ring instead of epoll.
 	bool NET_IO_URING;

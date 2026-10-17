@@ -39,8 +39,11 @@
 // next react(), or with --submit-after-writes be submitted before lower-priority tasks run; with --reap-after-writes
 // too, its completion must also be handled before them.
 //
+// With --user-space-recv (FLOW_KNOBS->TLS_USERSPACE_RECV) the kernel must hold only the send keys of each kernel TLS
+// connection and every check above must hold with OpenSSL decrypting what arrives.
+//
 //   ktls_unittest [--net-io-uring [--no-multishot] [--recv-buffers=N] [--submit-after-writes [--reap-after-writes]]]
-//                 [--main-thread-handshakes] [--openssl-conf=tls12|cbc]
+//                 [--user-space-recv] [--main-thread-handshakes] [--openssl-conf=tls12|cbc]
 
 #include <csignal>
 #include <cstdio>
@@ -641,7 +644,12 @@ Future<Void> runOne(bool tls,
 		check(c.ulp.empty() && s.ulp.empty(), label + ": no kernel TLS on either end");
 	} else {
 		check(c.ulp == "tls" && s.ulp == "tls", label + ": kernel TLS protocol on both ends");
-		check(c.tx && c.rx && s.tx && s.rx, label + ": kernel send and receive keys on both ends");
+		if (FLOW_KNOBS->TLS_USERSPACE_RECV) {
+			check(c.tx && !c.rx && s.tx && !s.rx,
+			      label + ": kernel send keys only on both ends (OpenSSL decrypts receives)");
+		} else {
+			check(c.tx && c.rx && s.tx && s.rx, label + ": kernel send and receive keys on both ends");
+		}
 	}
 	if (expectRing) {
 		const std::vector<int> watched = socketsInEpollSets();
@@ -789,6 +797,9 @@ int main(int argc, char** argv) {
 		} else if (arg.rfind("--recv-buffers=", 0) == 0) {
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->NET_IO_URING_RECV_BUFFERS = std::atoi(arg.c_str() + 15);
 			mode += " " + arg.substr(2);
+		} else if (arg == "--user-space-recv") {
+			const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_USERSPACE_RECV = true;
+			mode += " user-space recv";
 		} else if (arg == "--main-thread-handshakes") {
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_SERVER_HANDSHAKE_THREADS = 0;
 			const_cast<FlowKnobs*>(FLOW_KNOBS)->TLS_CLIENT_HANDSHAKE_THREADS = 0;
@@ -802,7 +813,7 @@ int main(int argc, char** argv) {
 			std::fprintf(stderr,
 			             "usage: %s [--net-io-uring [--no-multishot] [--recv-buffers=N] [--submit-after-writes "
 			             "[--reap-after-writes]]] "
-			             "[--main-thread-handshakes] "
+			             "[--user-space-recv] [--main-thread-handshakes] "
 			             "[--openssl-conf=tls12|cbc]\n",
 			             argv[0]);
 			return 2;

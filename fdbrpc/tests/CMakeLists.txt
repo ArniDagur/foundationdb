@@ -14,10 +14,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   if(NOT OPEN_FOR_IDE)
     foreach(variant IN ITEMS default main_thread_handshakes tls12 cbc
                               io_uring io_uring_main_thread_handshakes io_uring_tls12 io_uring_cbc
-                              io_uring_no_multishot io_uring_few_buffers io_uring_submit_after_writes io_uring_reap_after_writes)
+                              io_uring_no_multishot io_uring_few_buffers io_uring_submit_after_writes io_uring_reap_after_writes
+                              user_space_recv io_uring_user_space_recv io_uring_tls12_user_space_recv
+                              io_uring_no_multishot_user_space_recv io_uring_few_buffers_user_space_recv)
       set(args "")
-      string(REGEX REPLACE "^io_uring_?" "" base "${variant}")
-      if(NOT base STREQUAL variant)
+      string(REGEX REPLACE "_?user_space_recv$" "" rest "${variant}")
+      if(NOT rest STREQUAL variant)
+        list(APPEND args --user-space-recv)
+      endif()
+      string(REGEX REPLACE "^io_uring_?" "" base "${rest}")
+      if(NOT base STREQUAL rest)
         list(APPEND args --net-io-uring)
       endif()
       if(base STREQUAL "no_multishot")

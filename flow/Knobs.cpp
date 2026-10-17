@@ -156,6 +156,7 @@ void FlowKnobs::initialize(Randomize randomize, IsSimulated isSimulated) {
 	init( DISABLE_MAINTHREAD_TLS_HANDSHAKE,                  false );
 	init( TLS_HANDSHAKE_FLOWLOCK_PRIORITY, static_cast<int>(TaskPriority::DefaultYield) );
 	init( TLS_USE_KTLS,                                      false );
+init( TLS_USERSPACE_RECV,                                false );
 	init( NET_IO_URING,                                      false );
 	init( KAIO_IO_URING,                                     false );
 	init( KAIO_ZERO_FILL_GROWTH,                             false );
