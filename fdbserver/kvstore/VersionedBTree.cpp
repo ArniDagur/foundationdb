@@ -9102,6 +9102,76 @@ TEST_CASE("Lredwood/correctness/unit/deltaTree/RedwoodRecordRef") {
 	return Void();
 }
 
+// Redwood creates and drops a DeltaTree2 cursor for every page it visits. Dropping one publishes the decode cache's
+// memory use, which reads the cache's arena; when the cursor decoded nothing that read must be skipped, and when it
+// decoded nodes the published amount must match the cache.
+TEST_CASE("/redwood/correctness/unit/deltaTree/decodeCacheMemory") {
+	using Tree = DeltaTree2<RedwoodRecordRef>;
+	Arena arena;
+	std::vector<RedwoodRecordRef> items;
+	for (int i = 0; i < 500; ++i) {
+		items.push_back(RedwoodRecordRef(StringRef(arena, format("key%06d", i)), StringRef(arena, "value"_sr)));
+	}
+	RedwoodRecordRef prev;
+	RedwoodRecordRef next("\xff\xff\xff\xff"_sr);
+	const int bufferSize = items.size() * 100;
+	Tree* tree = (Tree*)new uint8_t[bufferSize];
+	tree->build(bufferSize, &items[0], &items[items.size()], &prev, &next);
+
+	auto arenaSizeCalls = [] {
+		for (auto* c : SimpleCounter<int64_t>::getCounters()) {
+			if (c->name() == "/flow/arena/getSizeCalls") {
+				return c->get();
+			}
+		}
+		return int64_t(0);
+	};
+	auto expectedUse = [](const Tree::DecodeCache& cache) {
+		return int64_t(sizeof(Tree) + cache.arena.getSize(FastInaccurateEstimate::True) +
+		               cache.decodedNodes.capacity() * sizeof(Tree::DecodedNode));
+	};
+
+	int64_t tracked = 0;
+	auto cache = makeReference<Tree::DecodeCache>(prev, next, &tracked);
+	{
+		Tree::Cursor c(cache, tree);
+		ASSERT(c.seekGreaterThanOrEqual(items[250]));
+		ASSERT(c.get() == items[250]);
+	}
+	ASSERT(cache->decodedNodes.size() > 1);
+	ASSERT_EQ(tracked, expectedUse(*cache));
+
+	// Revisiting decoded nodes decodes nothing, so dropping the cursor must not read the arena.
+	const size_t decoded = cache->decodedNodes.size();
+	const int64_t callsBefore = arenaSizeCalls();
+	{
+		Tree::Cursor c(cache, tree);
+		ASSERT(c.seekGreaterThanOrEqual(items[250]));
+		ASSERT(c.get() == items[250]);
+	}
+	ASSERT_EQ(cache->decodedNodes.size(), decoded);
+	ASSERT_EQ(arenaSizeCalls(), callsBefore);
+	ASSERT_EQ(tracked, expectedUse(*cache));
+
+	// Decoding the rest of the tree must be published when the cursor goes away.
+	{
+		Tree::Cursor c(cache, tree);
+		ASSERT(c.moveFirst());
+		int n = 1;
+		while (c.moveNext()) {
+			++n;
+		}
+		ASSERT_EQ(n, int(items.size()));
+	}
+	ASSERT(cache->decodedNodes.size() > decoded);
+	ASSERT_EQ(tracked, expectedUse(*cache));
+
+	cache.clear();
+	ASSERT_EQ(tracked, 0);
+	delete[](uint8_t*) tree;
+	return Void();
+}
+
 TEST_CASE("Lredwood/correctness/unit/deltaTree/RedwoodRecordRef2") {
 	// Sanity check on delta tree node format
 	ASSERT(DeltaTree2<RedwoodRecordRef>::Node::headerSize(false) == 4);

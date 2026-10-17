@@ -1089,6 +1089,7 @@ public:
 		// as those are the most efficient times to publish an update.
 		int lastKnownUsedMemory;
 		int64_t* pMemoryTracker;
+		size_t nodesAtLastUpdate = std::numeric_limits<size_t>::max(); // the first Cursor publishes
 
 		// Index 0 is always the root
 		std::vector<DecodedNode> decodedNodes;
@@ -1102,6 +1103,15 @@ public:
 				*pMemoryTracker += (usedNow - lastKnownUsedMemory);
 			}
 			lastKnownUsedMemory = usedNow;
+			nodesAtLastUpdate = decodedNodes.size();
+		}
+
+		// Only decoding nodes grows the arena and vector, and reading an idle cache's arena on every Cursor
+		// destruction costs a cache miss, so a Cursor that decoded nothing publishes nothing.
+		void updateUsedMemoryIfDecoded() {
+			if (decodedNodes.size() != nodesAtLastUpdate) {
+				updateUsedMemory();
+			}
 		}
 
 		template <class... Args>
@@ -1153,7 +1163,7 @@ public:
 
 		~Cursor() {
 			if (cache.isValid()) {
-				cache->updateUsedMemory();
+				cache->updateUsedMemoryIfDecoded();
 			}
 		}
 
