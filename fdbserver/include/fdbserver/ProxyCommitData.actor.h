@@ -381,6 +381,12 @@ struct ProxyCommitData {
 	    lastShardMove(invalidVersion), epoch(epoch) {
 		commitComputePerOperation.resize(SERVER_KNOBS->PROXY_COMPUTE_BUCKETS, 0.0);
 	}
+
+	// close() also deletes logAdapter.
+	~ProxyCommitData() {
+		if (txnStateStore)
+			txnStateStore->close();
+	}
 };
 struct RangeLock {
 public:
