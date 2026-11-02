@@ -781,9 +781,7 @@ ACTOR Future<Void> resolverCore(ResolverInterface resolver,
 		when(ResolutionSplitRequest req = waitNext(resolver.split.getFuture())) {
 			++self->splitRequests;
 			ResolutionSplitReply rep;
-			rep.key = self->iopsSample.splitEstimate(req.range, req.offset, req.front);
-			rep.used = self->iopsSample.getEstimate(req.front ? KeyRangeRef(req.range.begin, rep.key)
-			                                                  : KeyRangeRef(rep.key, req.range.end));
+			std::tie(rep.key, rep.used) = self->iopsSample.splitAndEstimate(req.range, req.offset, req.front);
 			req.reply.send(rep);
 		}
 		when(wait(actors.getResult())) {}

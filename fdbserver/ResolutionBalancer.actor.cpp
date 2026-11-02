@@ -20,10 +20,15 @@
 
 #include "fdbserver/ResolutionBalancer.actor.h"
 
+#include <functional>
+#include <tuple>
+
 #include "fdbclient/KeyRangeMap.h"
 #include "fdbserver/MasterInterface.h"
 #include "fdbserver/Knobs.h"
+#include "fdbserver/StorageMetrics.actor.h"
 #include "flow/flow.h"
+#include "flow/UnitTest.h"
 
 #include "flow/actorcompiler.h" // This must be the last #include.
 
@@ -107,8 +112,80 @@ static std::pair<KeyRangeRef, bool> findRange(CoalescedKeyRangeMap<int>& key_res
 			return std::make_pair(it->range(), true);
 		}
 	}
-	throw operation_failed(); // we are already attempting to move all of the data one resolver is assigned, so do not
-	                          // move anything
+	throw operation_failed(); // every range of src is already in movedRanges: being moved, or could not be cut
+}
+
+using SplitFn = std::function<Future<ResolutionSplitReply>(ResolutionSplitRequest)>;
+
+// Chooses ranges holding about `amount` of src's load to move to dest; throws operation_failed if nothing should move.
+// `key_resolver` must stay alive and unchanged until the returned future is ready.
+ACTOR static Future<Standalone<VectorRef<ResolverMoveRef>>> chooseRangesToMove(CoalescedKeyRangeMap<int>* key_resolver,
+                                                                              int src,
+                                                                              int dest,
+                                                                              int64_t amount,
+                                                                              SplitFn splitRequest) {
+	state Standalone<VectorRef<ResolverMoveRef>> movedRanges;
+	state Standalone<VectorRef<ResolverMoveRef>> triedRanges;
+	state bool skippedRange = false;
+	state std::pair<KeyRangeRef, bool> range;
+	loop {
+		bool noRangeLeft = false;
+		try {
+			range = findRange(*key_resolver, triedRanges, src, dest);
+		} catch (Error& e) {
+			// Out of candidates. src keeps any skipped range, so the moves chosen so far can stand; without a skip they
+			// would give away all of src's ranges.
+			if (e.code() != error_code_operation_failed || !skippedRange || movedRanges.empty())
+				throw;
+			noRangeLeft = true;
+		}
+		if (noRangeLeft) {
+			CODE_PROBE(true, "Resolution balancing keeps the moves chosen before a skipped range");
+			return movedRanges;
+		}
+
+		ResolutionSplitRequest req;
+		req.front = range.second;
+		req.offset = amount;
+		req.range = range.first;
+
+		ResolutionSplitReply reply = wait(splitRequest(req));
+		KeyRangeRef moveRange =
+		    range.second ? KeyRangeRef(range.first.begin, reply.key) : KeyRangeRef(reply.key, range.first.end);
+		triedRanges.push_back_deep(triedRanges.arena(), ResolverMoveRef(range.first, dest));
+		if (moveRange.empty()) {
+			// Nothing to cut (src has no sampled load before the range's end). The empty move would change nothing and
+			// be chosen again every round.
+			CODE_PROBE(true, "Resolution balancing skips a range the resolver cannot split");
+			TraceEvent("ResolutionRangeNotSplit")
+			    .suppressFor(1.0)
+			    .detail("Src", src)
+			    .detail("Dest", dest)
+			    .detail("Amount", amount)
+			    .detail("Range", range.first);
+			skippedRange = true;
+			continue;
+		}
+		TraceEvent("MovingResolutionRange")
+		    .detail("Src", src)
+		    .detail("Dest", dest)
+		    .detail("Amount", amount)
+		    .detail("StartRange", range.first)
+		    .detail("MoveRange", moveRange)
+		    .detail("Used", reply.used)
+		    .detail("KeyResolverRanges", key_resolver->size());
+		movedRanges.push_back_deep(movedRanges.arena(), ResolverMoveRef(moveRange, dest));
+		amount -= reply.used;
+		if (moveRange != range.first || amount <= 0)
+			return movedRanges;
+	}
+}
+
+// Actor state variables cannot be captured by name, so the split callback is built outside the actor.
+static SplitFn splitFromResolver(ResolverInterface resolver) {
+	return [resolver](ResolutionSplitRequest req) {
+		return brokenPromiseToNever(resolver.split.getReply(req, TaskPriority::ResolutionMetrics));
+	};
 }
 
 // Balance key ranges among resolvers so that their load are evenly distributed.
@@ -143,33 +220,8 @@ ACTOR Future<Void> ResolutionBalancer::resolutionBalancing_impl(ResolutionBalanc
 				                                total / self->resolvers.size() - metrics.begin()->first) /
 				                       2;
 				state Standalone<VectorRef<ResolverMoveRef>> movedRanges;
-
-				loop {
-					state std::pair<KeyRangeRef, bool> range = findRange(key_resolver, movedRanges, src, dest);
-
-					ResolutionSplitRequest req;
-					req.front = range.second;
-					req.offset = amount;
-					req.range = range.first;
-
-					ResolutionSplitReply split =
-					    wait(brokenPromiseToNever(self->resolvers[metrics.lastItem()->second].split.getReply(
-					        req, TaskPriority::ResolutionMetrics)));
-					KeyRangeRef moveRange = range.second ? KeyRangeRef(range.first.begin, split.key)
-					                                     : KeyRangeRef(split.key, range.first.end);
-					movedRanges.push_back_deep(movedRanges.arena(), ResolverMoveRef(moveRange, dest));
-					TraceEvent("MovingResolutionRange")
-					    .detail("Src", src)
-					    .detail("Dest", dest)
-					    .detail("Amount", amount)
-					    .detail("StartRange", range.first)
-					    .detail("MoveRange", moveRange)
-					    .detail("Used", split.used)
-					    .detail("KeyResolverRanges", key_resolver.size());
-					amount -= split.used;
-					if (moveRange != range.first || amount <= 0)
-						break;
-				}
+				wait(store(movedRanges,
+				           chooseRangesToMove(&key_resolver, src, dest, amount, splitFromResolver(self->resolvers[src]))));
 				for (auto& it : movedRanges)
 					key_resolver.insert(it.range, it.dest);
 				// for(auto& it : key_resolver.ranges())
@@ -185,4 +237,108 @@ ACTOR Future<Void> ResolutionBalancer::resolutionBalancing_impl(ResolutionBalanc
 			}
 		}
 	}
+}
+
+namespace {
+
+Future<ResolutionSplitReply> splitWithSample(const StorageMetricSample& sample, ResolutionSplitRequest req) {
+	ResolutionSplitReply reply;
+	std::tie(reply.key, reply.used) = sample.splitAndEstimate(req.range, req.offset, req.front);
+	return reply;
+}
+
+SplitFn splitUsingSample(const StorageMetricSample* sample) {
+	return [sample](ResolutionSplitRequest req) { return splitWithSample(*sample, req); };
+}
+
+int64_t sampledLoadOf(CoalescedKeyRangeMap<int>& keyResolver, const StorageMetricSample& sample, int resolver) {
+	int64_t load = 0;
+	for (auto r : keyResolver.ranges()) {
+		if (r.value() == resolver) {
+			load += sample.getEstimate(r.range());
+		}
+	}
+	return load;
+}
+
+} // namespace
+
+TEST_CASE("/fdbserver/ResolutionBalancer/SkipRangeThatCannotBeSplit") {
+	state CoalescedKeyRangeMap<int> keyResolver(0, normalKeys.end);
+	state StorageMetricSample srcSample(1);
+	state Standalone<VectorRef<ResolverMoveRef>> moves;
+	state int64_t before = 0;
+	state int round = 0;
+	keyResolver.insert(normalKeys, 0);
+	keyResolver.insert(KeyRangeRef("m"_sr, "t"_sr), 1);
+	srcSample.sample.insert("u"_sr, 100);
+	srcSample.sample.insert("v"_sr, 100);
+	srcSample.sample.insert("w"_sr, 100);
+	srcSample.sample.insert("x"_sr, 100);
+
+	for (round = 0; round < 2; ++round) {
+		before = sampledLoadOf(keyResolver, srcSample, 0);
+		wait(store(moves, chooseRangesToMove(&keyResolver, 0, 1, 150, splitUsingSample(&srcSample))));
+		for (const auto& move : moves) {
+			ASSERT(!move.range.empty());
+			keyResolver.insert(move.range, move.dest);
+		}
+		ASSERT_LT(sampledLoadOf(keyResolver, srcSample, 0), before);
+	}
+	return Void();
+}
+
+TEST_CASE("/fdbserver/ResolutionBalancer/MoveFromBorderingRange") {
+	state CoalescedKeyRangeMap<int> keyResolver(0, normalKeys.end);
+	state StorageMetricSample srcSample(1);
+	state Standalone<VectorRef<ResolverMoveRef>> moves;
+	keyResolver.insert(normalKeys, 1);
+	keyResolver.insert(KeyRangeRef(""_sr, "m"_sr), 0);
+	srcSample.sample.insert("a"_sr, 100);
+	srcSample.sample.insert("k"_sr, 100);
+	srcSample.sample.insert("l"_sr, 100);
+
+	wait(store(moves, chooseRangesToMove(&keyResolver, 0, 1, 150, splitUsingSample(&srcSample))));
+	ASSERT_EQ(moves.size(), 1);
+	ASSERT(moves[0].range == KeyRangeRef("k"_sr, "m"_sr));
+	ASSERT_EQ(moves[0].dest, 1);
+	return Void();
+}
+
+TEST_CASE("/fdbserver/ResolutionBalancer/NothingToMoveWhenNoRangeCanBeSplit") {
+	state CoalescedKeyRangeMap<int> keyResolver(0, normalKeys.end);
+	state StorageMetricSample srcSample(1);
+	state Standalone<VectorRef<ResolverMoveRef>> moves;
+	state bool nothingMoved = false;
+	keyResolver.insert(normalKeys, 1);
+	keyResolver.insert(KeyRangeRef(""_sr, "m"_sr), 0);
+	srcSample.sample.insert("u"_sr, 100);
+
+	try {
+		wait(store(moves, chooseRangesToMove(&keyResolver, 0, 1, 150, splitUsingSample(&srcSample))));
+	} catch (Error& e) {
+		ASSERT_EQ(e.code(), error_code_operation_failed);
+		nothingMoved = true;
+	}
+	ASSERT(nothingMoved);
+	ASSERT_EQ(keyResolver.size(), 2);
+	ASSERT_EQ(keyResolver.rangeContaining("a"_sr).value(), 0);
+	return Void();
+}
+
+TEST_CASE("/fdbserver/ResolutionBalancer/KeepMovesWhenLaterRangeIsSkipped") {
+	state CoalescedKeyRangeMap<int> keyResolver(0, normalKeys.end);
+	state StorageMetricSample srcSample(1);
+	state Standalone<VectorRef<ResolverMoveRef>> moves;
+	keyResolver.insert(normalKeys, 0);
+	keyResolver.insert(KeyRangeRef("c"_sr, "m"_sr), 2);
+	keyResolver.insert(KeyRangeRef("m"_sr, "p"_sr), 3);
+	keyResolver.insert(KeyRangeRef("p"_sr, "t"_sr), 1);
+	srcSample.sample.insert("u"_sr, 100);
+
+	wait(store(moves, chooseRangesToMove(&keyResolver, 0, 1, 150, splitUsingSample(&srcSample))));
+	ASSERT_EQ(moves.size(), 1);
+	ASSERT(moves[0].range == KeyRangeRef("t"_sr, normalKeys.end));
+	ASSERT_EQ(moves[0].dest, 1);
+	return Void();
 }
