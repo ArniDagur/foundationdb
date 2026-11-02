@@ -128,8 +128,10 @@ ACTOR static Future<Standalone<VectorRef<ResolverMoveRef>>> chooseRangesToMove(C
 	state Standalone<VectorRef<ResolverMoveRef>> triedRanges;
 	state bool skippedRange = false;
 	state std::pair<KeyRangeRef, bool> range;
+	// State: the catch block below is compiled into a separate function.
+	state bool noRangeLeft = false;
 	loop {
-		bool noRangeLeft = false;
+		noRangeLeft = false;
 		try {
 			range = findRange(*key_resolver, triedRanges, src, dest);
 		} catch (Error& e) {

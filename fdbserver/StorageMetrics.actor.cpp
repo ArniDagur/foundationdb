@@ -796,7 +796,8 @@ TEST_CASE("/fdbserver/StorageMetricSample/rangeSplitPoints/chunkTooLarge") {
 TEST_CASE("/fdbserver/StorageMetricSample/rangeSplitPoints/nonPositiveChunkSize") {
 
 	int64_t sampleUnit = SERVER_KNOBS->BYTES_READ_UNITS_PER_SAMPLE;
-	StorageServerMetrics ssm;
+	// State: the try blocks below are compiled into separate functions.
+	state StorageServerMetrics ssm;
 
 	ssm.byteSample.sample.insert("A"_sr, 200 * sampleUnit);
 	ssm.byteSample.sample.insert("Absolute"_sr, 800 * sampleUnit);
